@@ -1,13 +1,21 @@
 //! Background tray service: watches for marked drives and backs them up automatically.
 //!
-//! Pure Win32 (no GUI framework) so it idles at a few MB of RAM and ~0% CPU.
+//! Built to cost next to nothing while idle (it runs 24/7):
+//! * Pure Win32, no GUI framework; runs in Windows' efficiency mode.
+//! * Event-driven: Windows tells us when drives arrive or leave; settings are kept in
+//!   memory and only re-read when the manager window says they changed.
+//! * Schedules use one exact timer for the next due backup instead of polling.
+//! * Only drives known to be backup drives are ever touched after they're identified,
+//!   so sleeping internal disks aren't woken up.
+//! * A one-minute safety-net check costs one GetLogicalDrives call and one file stat.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -17,7 +25,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use syncapp::config::{Config, DriveReg};
+use syncapp::config::{config_path, Config, DriveReg};
 use syncapp::engine::{human_bytes, Event};
 use syncapp::schedule::{self, Clock};
 use syncapp::service::{self, Identity};
@@ -26,11 +34,20 @@ use syncapp::{info, warn};
 
 pub const TRAY_LOCK: &str = "Local\\SyncApp-Tray";
 pub const TRAY_CLASS: &str = "SyncAppTrayHost";
+/// Posted by the manager window when settings or history changed.
+pub const WM_SYNCAPP_RELOAD: u32 = WM_APP + 2;
 
 const WM_TRAY: u32 = WM_APP + 1;
-const TIMER_POLL: usize = 1;
+const WM_BACKUP_DONE: u32 = WM_APP + 3;
+const TIMER_SAFETY: usize = 1;
 const TIMER_ARRIVAL: usize = 2;
+const TIMER_SCHEDULE: usize = 3;
+const SAFETY_POLL_MS: u32 = 60_000;
+/// Re-check the schedule at least this often, in case the clock jumps or the PC slept.
+const MAX_SCHEDULE_WAIT_S: u64 = 30 * 60;
 const DBT_DEVICEARRIVAL: usize = 0x8000;
+const DBT_DEVICEREMOVECOMPLETE: usize = 0x8004;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const ID_OPEN: u16 = 100;
 const ID_BACKUP_NOW: u16 = 101;
 const ID_PAUSE: u16 = 102;
@@ -40,30 +57,73 @@ const ID_EXIT: u16 = 104;
 static HWND_G: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static CANCEL: AtomicBool = AtomicBool::new(false);
-static STATE: Mutex<State> = Mutex::new(State {
-    known_mask: 0,
-    busy: Vec::new(),
-    last_run: Vec::new(),
-    workers: Vec::new(),
-    last_repeat_check: None,
-});
+static LAST_LOGGED_NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct State {
+    cfg: Config,
+    cfg_mtime: Option<SystemTime>,
+    /// Drive letters present last time we looked.
     known_mask: u32,
-    /// (drive_id, status text) of running backups
+    /// Plugged-in backup drives: root ("E:\") -> drive id.
+    backup_drives: HashMap<String, String>,
+    /// (drive_id, status text) of running backups.
     busy: Vec<(String, String)>,
-    last_run: Vec<(String, Instant)>,
+    /// When a backup to each drive last failed to run (for retry throttling).
+    last_attempt: HashMap<String, Instant>,
+    /// Unix time of each drive's last completed backup (from history, then kept up to date).
+    last_backup: HashMap<String, u64>,
     workers: Vec<JoinHandle<()>>,
-    last_repeat_check: Option<Instant>,
 }
+
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
+    Mutex::new(State {
+        cfg: Config::default(),
+        cfg_mtime: None,
+        known_mask: 0,
+        backup_drives: HashMap::new(),
+        busy: Vec::new(),
+        last_attempt: HashMap::new(),
+        last_backup: HashMap::new(),
+        workers: Vec::new(),
+    })
+});
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn cfg() -> Config {
+    state().cfg.clone()
+}
+
 fn hwnd() -> HWND {
     HWND_G.load(Ordering::Relaxed) as HWND
 }
+
+fn file_mtime(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+}
+
+/// Re-read settings if the file changed (a single stat when it hasn't).
+fn reload_config(force: bool) {
+    let mtime = file_mtime(&config_path());
+    if !force && mtime == state().cfg_mtime {
+        return;
+    }
+    match Config::load() {
+        Ok(c) => {
+            let mut st = state();
+            st.cfg = c;
+            st.cfg_mtime = mtime;
+        }
+        Err(e) => {
+            warn!("{e}");
+            state().cfg_mtime = mtime; // don't re-parse a broken file every minute
+        }
+    }
+}
+
+// ------------------------------------------------------------------ tray icon
 
 fn copy_wide(dst: &mut [u16], s: &str) {
     let w: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
@@ -114,11 +174,16 @@ fn update_tip() {
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
 
+// ------------------------------------------------------------------ main loop
+
 pub fn run() {
     let Ok(Some(_lock)) = NamedLock::try_acquire(TRAY_LOCK) else {
         return; // already running
     };
+    win::enable_efficiency_mode();
     info!("Background service started");
+    reload_config(true);
+    state().last_backup = service::last_backups();
     unsafe {
         let hinst = GetModuleHandleW(null());
         let class = wide(TRAY_CLASS);
@@ -140,9 +205,10 @@ pub fn run() {
         HWND_G.store(h as isize, Ordering::Relaxed);
         TASKBAR_CREATED.store(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()), Ordering::Relaxed);
         add_icon();
-        // known_mask starts at 0, so drives already plugged in at login count as arrivals.
+        // known_mask starts at 0, so drives already plugged in at sign-in count as arrivals.
         SetTimer(h, TIMER_ARRIVAL, 3000, None);
-        SetTimer(h, TIMER_POLL, 2000, None);
+        SetTimer(h, TIMER_SAFETY, SAFETY_POLL_MS, None);
+        win::trim_memory();
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -159,18 +225,61 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     unsafe {
         match msg {
             WM_TIMER => {
-                if wp == TIMER_ARRIVAL {
-                    KillTimer(h, TIMER_ARRIVAL);
+                match wp {
+                    TIMER_ARRIVAL => {
+                        KillTimer(h, TIMER_ARRIVAL);
+                        drives_changed();
+                    }
+                    TIMER_SCHEDULE => {
+                        KillTimer(h, TIMER_SCHEDULE);
+                        run_due_schedules();
+                    }
+                    _ => {
+                        // Safety net, once a minute: catches anything the events missed.
+                        drives_changed();
+                    }
                 }
-                check_drives();
                 0
             }
             WM_DEVICECHANGE => {
-                if wp == DBT_DEVICEARRIVAL {
+                match wp {
                     // Give Windows a moment to mount the volume, then look.
-                    SetTimer(h, TIMER_ARRIVAL, 1500, None);
+                    DBT_DEVICEARRIVAL => {
+                        SetTimer(h, TIMER_ARRIVAL, 1500, None);
+                    }
+                    DBT_DEVICEREMOVECOMPLETE => drives_changed(),
+                    _ => {}
                 }
                 1
+            }
+            WM_SYNCAPP_RELOAD => {
+                reload_config(true);
+                rescan_backup_drives();
+                state().last_backup = service::last_backups();
+                reschedule();
+                0
+            }
+            WM_BACKUP_DONE => {
+                let idle = {
+                    let mut st = state();
+                    st.workers.retain(|w| !w.is_finished());
+                    st.busy.is_empty()
+                };
+                if idle {
+                    win::trim_memory();
+                }
+                reschedule();
+                0
+            }
+            WM_POWERBROADCAST => {
+                if wp == PBT_APMRESUMEAUTOMATIC {
+                    drives_changed();
+                }
+                1
+            }
+            WM_TIMECHANGE => {
+                reschedule();
+                0
             }
             WM_TRAY => {
                 match lp as u32 {
@@ -233,12 +342,12 @@ fn open_manager() {
 
 unsafe fn show_menu(h: HWND) {
     unsafe {
-        let cfg = Config::load().unwrap_or_default();
+        let paused = state().cfg.paused;
         let status = {
             let st = state();
             if !st.busy.is_empty() {
                 st.busy.iter().map(|b| b.1.clone()).collect::<Vec<_>>().join("; ")
-            } else if cfg.paused {
+            } else if paused {
                 "Automatic backups paused".into()
             } else {
                 "Watching for backup drives".into()
@@ -249,7 +358,7 @@ unsafe fn show_menu(h: HWND) {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, ID_OPEN as usize, wide("Open SyncApp").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_BACKUP_NOW as usize, wide("Back up connected drives now").as_ptr());
-        let pause_flags = MF_STRING | if cfg.paused { MF_CHECKED } else { MF_UNCHECKED };
+        let pause_flags = MF_STRING | if paused { MF_CHECKED } else { MF_UNCHECKED };
         AppendMenuW(menu, pause_flags, ID_PAUSE as usize, wide("Pause automatic backups").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, ID_LOG as usize, wide("Open log file").as_ptr());
@@ -269,21 +378,25 @@ unsafe fn on_command(h: HWND, id: u16) {
     match id {
         ID_OPEN => open_manager(),
         ID_BACKUP_NOW => {
-            let Ok(cfg) = Config::load() else { return };
+            reload_config(false);
+            let cfg = cfg();
             let drives = service::connected_drives(&cfg);
             if drives.is_empty() {
                 notify("SyncApp", "No marked backup drive is connected.", false);
             }
             for (root, reg) in drives {
-                start_backup(cfg.clone(), root, reg);
+                start_backup(cfg.clone(), root, reg, false);
             }
         }
         ID_PAUSE => {
-            if let Ok(mut cfg) = Config::load() {
-                cfg.paused = !cfg.paused;
-                let _ = cfg.save();
-                info!("Automatic backups {}", if cfg.paused { "paused" } else { "resumed" });
+            reload_config(false);
+            let mut c = cfg();
+            c.paused = !c.paused;
+            if c.save().is_ok() {
+                info!("Automatic backups {}", if c.paused { "paused" } else { "resumed" });
             }
+            reload_config(true);
+            reschedule();
         }
         ID_LOG => win::shell_open(&syncapp::log::log_path()),
         ID_EXIT => {
@@ -309,42 +422,37 @@ unsafe fn on_command(h: HWND, id: u16) {
     }
 }
 
-fn check_drives() {
-    let cfg = match Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("{e}");
-            return;
-        }
-    };
+// ------------------------------------------------------------------ drives
+
+/// React to drive letters appearing or disappearing. Only newly arrived drives are
+/// identified; nothing else is read.
+fn drives_changed() {
+    reload_config(false);
     let mask = win::drive_mask();
-    let (arrived, repeat_check) = {
+    let arrived = {
         let mut st = state();
         let arrived = mask & !st.known_mask;
+        let removed = st.known_mask & !mask;
         st.known_mask = mask;
-        st.workers.retain(|w| !w.is_finished());
-        let due = st.last_repeat_check.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
-        if due {
-            st.last_repeat_check = Some(Instant::now());
+        if removed != 0 {
+            st.backup_drives.retain(|root, _| mask >> (root.as_bytes()[0] - b'A') & 1 == 1);
         }
-        (arrived, due)
+        st.workers.retain(|w| !w.is_finished());
+        arrived
     };
-
     if arrived != 0 {
-        for root in win::candidate_drives() {
-            let bit = (root.as_bytes()[0] - b'A') as u32;
-            if arrived >> bit & 1 == 0 {
-                continue;
-            }
+        let cfg = cfg();
+        for root in win::candidate_drives_in(arrived) {
             match service::identify(&cfg, Path::new(&root)) {
                 Identity::Registered(reg) => {
+                    state().backup_drives.insert(root.clone(), reg.drive_id.clone());
                     if !reg.auto_backup {
                         info!("Drive '{}' connected at {root} (automatic backup off)", reg.name);
                     } else if cfg.paused {
                         info!("Drive '{}' connected at {root} (automatic backups paused)", reg.name);
                     } else {
                         info!("Drive '{}' connected at {root}", reg.name);
-                        start_backup(cfg.clone(), root, reg);
+                        start_backup(cfg.clone(), root, reg, true);
                     }
                 }
                 Identity::SerialMismatch(reg) => {
@@ -353,44 +461,109 @@ fn check_drives() {
                         "Drive not trusted",
                         &format!(
                             "{} looks like '{}' but its volume ID doesn't match, so nothing was backed up. If you reformatted it, mark it again in SyncApp.",
-                            &root[..2], reg.name
+                            &root[..2],
+                            reg.name
                         ),
                         true,
                     );
                 }
-                Identity::Unknown => {} // not a backup drive: never touched
+                Identity::Unknown => {} // not a backup drive: never touched again
             }
         }
     }
+    reschedule();
+}
 
-    // Scheduled backups while a drive stays plugged in. Checked once a minute;
-    // only touches drives when one actually has a schedule.
-    if repeat_check && !cfg.paused && cfg.drives.iter().any(|d| d.auto_backup && !d.schedule.is_off()) {
-        let clock = Clock::now();
-        for (root, reg) in service::connected_drives(&cfg) {
-            if !reg.auto_backup || reg.schedule.is_off() {
-                continue;
+/// Re-identify plugged-in drives (after the manager marks or unmarks one). Rare.
+fn rescan_backup_drives() {
+    let cfg = cfg();
+    let found: HashMap<String, String> =
+        service::connected_drives(&cfg).into_iter().map(|(root, reg)| (root, reg.drive_id)).collect();
+    let mut st = state();
+    st.backup_drives = found;
+    st.known_mask = win::drive_mask();
+}
+
+// ------------------------------------------------------------------ schedules
+
+/// Set one timer for the earliest scheduled backup among plugged-in drives.
+fn reschedule() {
+    let h = hwnd();
+    let next = {
+        let st = state();
+        if st.cfg.paused {
+            None
+        } else {
+            let clock = Clock::now();
+            st.backup_drives
+                .values()
+                .filter_map(|id| st.cfg.drive(id))
+                .filter(|reg| reg.auto_backup && !reg.schedule.is_off())
+                .filter(|reg| !st.busy.iter().any(|b| b.0 == reg.drive_id))
+                .filter_map(|reg| {
+                    let t = reg.schedule.next_run(st.last_backup.get(&reg.drive_id).copied(), &clock)?;
+                    // Don't retry a failed attempt sooner than RETRY_AFTER_S.
+                    let retry_at = st.last_attempt.get(&reg.drive_id).map(|a| {
+                        clock.now + schedule::RETRY_AFTER_S.saturating_sub(a.elapsed().as_secs())
+                    });
+                    Some(retry_at.map_or(t, |r| t.max(r)))
+                })
+                .min()
+                .map(|t| {
+                    // Log when the next scheduled time changes (rare), for transparency.
+                    if LAST_LOGGED_NEXT.swap(t, Ordering::Relaxed) != t {
+                        info!("Next scheduled backup at {}", win::local_time_string(t));
+                    }
+                    t.saturating_sub(clock.now)
+                })
+        }
+    };
+    unsafe {
+        match next {
+            None => {
+                KillTimer(h, TIMER_SCHEDULE);
             }
-            // Based on the last backup of any kind (plug-in, manual or scheduled), so a
-            // backup you just ran isn't immediately repeated.
-            let last = service::last_backup(&reg.drive_id).map(|h| h.finished_at);
-            if !reg.schedule.is_due(last, &clock) {
-                continue;
-            }
-            // If an attempt couldn't run (e.g. no sources selected), don't retry every minute.
-            let recently_tried = state()
-                .last_run
-                .iter()
-                .any(|(id, t)| *id == reg.drive_id && t.elapsed() < Duration::from_secs(schedule::RETRY_AFTER_S));
-            if !recently_tried {
-                info!("Scheduled backup to '{}' ({})", reg.name, reg.schedule.describe());
-                start_backup(cfg.clone(), root, reg);
+            Some(wait_s) => {
+                let ms = (wait_s.clamp(1, MAX_SCHEDULE_WAIT_S) * 1000) as u32;
+                SetTimer(h, TIMER_SCHEDULE, ms, None);
             }
         }
     }
 }
 
-fn start_backup(cfg: Config, root: String, reg: DriveReg) {
+fn run_due_schedules() {
+    reload_config(false);
+    let clock = Clock::now();
+    let due: Vec<(String, DriveReg)> = {
+        let st = state();
+        if st.cfg.paused {
+            vec![]
+        } else {
+            st.backup_drives
+                .iter()
+                .filter_map(|(root, id)| st.cfg.drive(id).map(|r| (root.clone(), r.clone())))
+                .filter(|(_, reg)| reg.auto_backup && reg.schedule.is_due(st.last_backup.get(&reg.drive_id).copied(), &clock))
+                .filter(|(_, reg)| {
+                    st.last_attempt
+                        .get(&reg.drive_id)
+                        .is_none_or(|a| a.elapsed() >= Duration::from_secs(schedule::RETRY_AFTER_S))
+                })
+                .collect()
+        }
+    };
+    let cfg = cfg();
+    for (root, reg) in due {
+        info!("Scheduled backup to '{}' ({})", reg.name, reg.schedule.describe());
+        start_backup(cfg.clone(), root, reg, true);
+    }
+    reschedule();
+}
+
+// ------------------------------------------------------------------ backups
+
+/// Run a backup on a worker thread. Automatic (`background`) backups use low disk and
+/// memory priority so they don't slow down whatever you're doing.
+fn start_backup(cfg: Config, root: String, reg: DriveReg, background: bool) {
     {
         let mut st = state();
         if st.busy.iter().any(|b| b.0 == reg.drive_id) {
@@ -400,6 +573,10 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg) {
     }
     update_tip();
     let handle = std::thread::spawn(move || {
+        win::thread_full_speed();
+        if background {
+            win::thread_background_mode();
+        }
         let notify_on = cfg.notifications;
         let id = reg.drive_id.clone();
         let set_status = |s: String| {
@@ -434,6 +611,7 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg) {
                 _ => break,
             }
         }
+        let completed = result.is_ok();
         match result {
             Ok(r) => {
                 let (title, body, problem) = service::describe(&reg, &root, &r);
@@ -450,10 +628,16 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg) {
         {
             let mut st = state();
             st.busy.retain(|b| b.0 != reg.drive_id);
-            st.last_run.retain(|(i, _)| *i != reg.drive_id);
-            st.last_run.push((reg.drive_id.clone(), Instant::now()));
+            if completed {
+                st.last_attempt.remove(&reg.drive_id);
+                st.last_backup.insert(reg.drive_id.clone(), win::now_unix());
+            } else {
+                // Only failed attempts are throttled.
+                st.last_attempt.insert(reg.drive_id.clone(), Instant::now());
+            }
         }
         update_tip();
+        unsafe { PostMessageW(hwnd(), WM_BACKUP_DONE, 0, 0) };
     });
     state().workers.push(handle);
 }

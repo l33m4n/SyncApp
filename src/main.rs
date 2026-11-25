@@ -60,6 +60,16 @@ pub fn tray_running() -> bool {
     !matches!(NamedLock::try_acquire(tray::TRAY_LOCK), Ok(Some(_)))
 }
 
+/// Tell the background service that settings or history changed (cheap; no polling needed).
+pub fn poke_tray() {
+    unsafe {
+        let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
+        if !h.is_null() {
+            PostMessageW(h, tray::WM_SYNCAPP_RELOAD, 0, 0);
+        }
+    }
+}
+
 pub fn spawn_tray() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe).arg("--tray").spawn();

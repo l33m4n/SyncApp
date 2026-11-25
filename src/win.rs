@@ -60,7 +60,11 @@ pub fn drive_mask() -> u32 {
 
 /// Roots of drives that could be backup targets: removable or fixed, never the system drive.
 pub fn candidate_drives() -> Vec<String> {
-    let mask = drive_mask();
+    candidate_drives_in(drive_mask())
+}
+
+/// Like `candidate_drives`, but only among the letters set in `mask`.
+pub fn candidate_drives_in(mask: u32) -> Vec<String> {
     let sys = system_root();
     (0..26u8)
         .filter(|i| mask >> i & 1 == 1)
@@ -282,5 +286,67 @@ impl Drop for NamedLock {
             }
             CloseHandle(self.h);
         }
+    }
+}
+
+// ---------------------------------------------------------------- idle-cost helpers
+
+/// Let Windows run this process on efficiency cores / at low clock while it idles (Windows 11 EcoQoS).
+pub fn enable_efficiency_mode() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+/// Exempt the calling thread from efficiency mode (used by backup workers so hashing runs at full speed).
+pub fn thread_full_speed() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, ThreadPowerThrottling, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+    };
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    unsafe {
+        SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            (&state as *const THREAD_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+/// Low disk-I/O and memory priority for the calling thread, so automatic backups
+/// don't make the PC sluggish while you're using it.
+pub fn thread_background_mode() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+}
+
+/// Give back memory pages the process isn't using right now (e.g. after a backup).
+pub fn trim_memory() {
+    use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        K32EmptyWorkingSet(GetCurrentProcess());
     }
 }

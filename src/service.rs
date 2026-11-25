@@ -285,7 +285,7 @@ impl HistoryRecord {
     fn from_backup(reg: &DriveReg, r: &Report) -> Self {
         let mut errors = r.failed.clone();
         errors.extend(r.missing_sources.iter().map(|s| (s.clone(), "source not found".to_string())));
-        errors.truncate(200);
+        errors.truncate(HISTORY_ERRORS_MAX);
         HistoryRecord {
             kind: "backup".into(),
             drive_id: reg.drive_id.clone(),
@@ -304,7 +304,7 @@ impl HistoryRecord {
     fn from_verify(reg: &DriveReg, r: &VerifyReport) -> Self {
         let mut errors: Vec<(String, String)> = r.corrupted.iter().map(|k| (k.clone(), "corrupted".into())).collect();
         errors.extend(r.missing.iter().map(|k| (k.clone(), "missing from drive".into())));
-        errors.truncate(200);
+        errors.truncate(HISTORY_ERRORS_MAX);
         HistoryRecord {
             kind: "verify".into(),
             drive_id: reg.drive_id.clone(),
@@ -321,7 +321,9 @@ impl HistoryRecord {
     }
 }
 
-const HISTORY_MAX: usize = 1000;
+const HISTORY_MAX: usize = 500;
+/// Per-entry cap on stored error lines; the log file has the full list.
+const HISTORY_ERRORS_MAX: usize = 50;
 
 fn history_path() -> PathBuf {
     data_dir().join("history.json")
@@ -342,6 +344,21 @@ fn history_append(rec: HistoryRecord) {
     if let Ok(b) = serde_json::to_vec(&h) {
         let _ = engine::atomic_write(&history_path(), &b);
     }
+}
+
+pub fn history_path_pub() -> PathBuf {
+    history_path()
+}
+
+/// Finish time of the latest backup for every drive, from one read of the history.
+pub fn last_backups() -> std::collections::HashMap<String, u64> {
+    let mut m = std::collections::HashMap::new();
+    for r in history_load() {
+        if r.kind == "backup" {
+            m.insert(r.drive_id, r.finished_at);
+        }
+    }
+    m
 }
 
 pub fn last_backup(drive_id: &str) -> Option<HistoryRecord> {

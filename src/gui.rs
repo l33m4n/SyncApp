@@ -392,6 +392,10 @@ struct App {
     mismatched: Vec<(String, DriveReg)>,
     unmarked: Vec<UnmarkedDrive>,
     last_scan: Instant,
+    last_full_scan: Instant,
+    last_mask: u32,
+    last_probe: Instant,
+    history_mtime: Option<SystemTime>,
     tray_running: bool,
     history: Vec<HistoryRecord>,
     history_selected: Option<usize>,
@@ -507,6 +511,10 @@ impl App {
             mismatched: vec![],
             unmarked: vec![],
             last_scan: Instant::now() - Duration::from_secs(60),
+            last_full_scan: Instant::now() - Duration::from_secs(60),
+            last_mask: 0,
+            last_probe: Instant::now() - Duration::from_secs(60),
+            history_mtime: None,
             tray_running: false,
             history: service::history_load(),
             history_selected: None,
@@ -575,10 +583,45 @@ impl App {
         if now != was_connected {
             self.drive_stats.retain(|id, _| now.contains(id));
         }
-        self.tray_running = crate::tray_running();
-        self.history = service::history_load();
+        self.last_full_scan = Instant::now();
+        self.last_mask = win::drive_mask();
+        self.probe_tray();
+        self.reload_history_if_changed();
         if self.selected_drive.as_ref().is_none_or(|id| self.cfg.drive(id).is_none()) {
             self.selected_drive = self.cfg.drives.first().map(|d| d.drive_id.clone());
+        }
+    }
+
+    /// Cheap periodic check: only does real work when something actually changed.
+    fn tick(&mut self) {
+        self.last_scan = Instant::now();
+        if win::drive_mask() != self.last_mask || self.last_full_scan.elapsed() > Duration::from_secs(15) {
+            self.refresh(); // drives changed, or refresh free space now and then
+            return;
+        }
+        let mt = file_mtime(&config_path());
+        if mt != self.cfg_mtime && self.cfg_error.is_none() {
+            if let Ok(c) = Config::load() {
+                self.cfg = c;
+            }
+            self.cfg_mtime = mt;
+        }
+        self.reload_history_if_changed();
+        if self.last_probe.elapsed() > Duration::from_secs(10) {
+            self.probe_tray();
+        }
+    }
+
+    fn probe_tray(&mut self) {
+        self.last_probe = Instant::now();
+        self.tray_running = crate::tray_running();
+    }
+
+    fn reload_history_if_changed(&mut self) {
+        let mt = file_mtime(&service::history_path_pub());
+        if mt != self.history_mtime {
+            self.history_mtime = mt;
+            self.history = service::history_load();
         }
     }
 
@@ -588,7 +631,10 @@ impl App {
             return;
         }
         match self.cfg.save() {
-            Ok(()) => self.cfg_mtime = file_mtime(&config_path()),
+            Ok(()) => {
+                self.cfg_mtime = file_mtime(&config_path());
+                crate::poke_tray();
+            }
             Err(e) => self.message = Some((e, true)),
         }
     }
@@ -689,7 +735,8 @@ impl App {
         let verify = res.verify.take();
         drop(p);
         self.drive_stats.clear();
-        self.history = service::history_load();
+        self.reload_history_if_changed();
+        crate::poke_tray();
         if let Some((name, report)) = verify {
             self.verify_view = Some(VerifyView::new(name, win::now_unix(), report));
         }
@@ -758,10 +805,16 @@ impl App {
 
     fn ui_root(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if self.last_scan.elapsed() > Duration::from_secs(2) {
-            self.refresh();
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if minimized {
+            // Nothing to show: check back rarely and do no scanning.
+            ctx.request_repaint_after(Duration::from_secs(10));
+        } else {
+            if self.last_scan.elapsed() > Duration::from_secs(2) {
+                self.tick();
+            }
+            ctx.request_repaint_after(Duration::from_secs(2));
         }
-        ctx.request_repaint_after(Duration::from_secs(2));
         self.handle_finished_job(&ctx);
         if std::mem::take(&mut self.dev_verify) {
             if let Some((c, r)) = self.connected.first() {
@@ -1674,6 +1727,7 @@ impl App {
                 }
                 self.save();
                 self.selected_drive = Some(r.drive_id.clone());
+                crate::poke_tray();
                 self.message = Some((format!("\"{}\" ({}) is now a backup drive. Click \"Back up now\" to make the first backup.", r.name, &m.root[..2]), false));
                 self.refresh();
             }
@@ -2308,6 +2362,7 @@ impl App {
                 Ok(()) => {
                     self.cfg_mtime = file_mtime(&config_path());
                     self.message = Some((format!("\"{name}\" is no longer a backup drive."), false));
+                    crate::poke_tray();
                     self.selected_drive = None;
                     self.refresh();
                 }
