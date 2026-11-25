@@ -356,6 +356,7 @@ impl VerifyView {
 // ------------------------------------------------------------------ app
 
 enum Confirm {
+    Uninstall,
     Unregister { id: String, name: String },
     RemoveSource(String),
     RestoreOverwrite(Vec<(String, PathBuf)>, String),
@@ -408,7 +409,14 @@ struct App {
     selected_drive: Option<String>,
     renaming: Option<(String, String)>,
     mark: Option<MarkDialog>,
-    drive_stats: HashMap<String, (u64, u64)>,
+    /// (files, bytes) per connected drive's manifest, loaded off the UI thread.
+    drive_stats: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    drive_stats_pending: HashSet<String>,
+    /// Drives currently locked by a backup/verify/restore (refreshed every couple of seconds).
+    busy_drives: HashSet<String>,
+    /// Settings are written shortly after the last change, not on every frame of a drag.
+    save_due: Option<Instant>,
+    uninstall_remove_data: bool,
     // sizes of sources, computed in the background
     sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     sizes_sig: String,
@@ -456,7 +464,8 @@ fn files_word(n: u64) -> String {
 }
 
 fn short_hash(h: &str) -> String {
-    if h.len() > 16 { format!("{}...", &h[..16]) } else { h.to_string() }
+    // chars(), not byte slicing: a damaged manifest must not be able to crash the window.
+    if h.chars().count() > 16 { format!("{}...", h.chars().take(16).collect::<String>()) } else { h.to_string() }
 }
 
 /// Small filled status circle (drawn, so it doesn't depend on font glyphs).
@@ -525,7 +534,11 @@ impl App {
             autostart: win::get_autostart().is_some(),
             renaming: None,
             mark: None,
-            drive_stats: HashMap::new(),
+            drive_stats: Default::default(),
+            drive_stats_pending: HashSet::new(),
+            busy_drives: HashSet::new(),
+            save_due: None,
+            uninstall_remove_data: false,
             sizes: Default::default(),
             sizes_sig: String::new(),
             browser: None,
@@ -581,7 +594,7 @@ impl App {
         // Drop cached stats for drives that were unplugged.
         let now: HashSet<String> = self.connected.iter().map(|(_, r)| r.drive_id.clone()).collect();
         if now != was_connected {
-            self.drive_stats.retain(|id, _| now.contains(id));
+            self.drive_stats.lock().unwrap().retain(|id, _| now.contains(id));
         }
         self.last_full_scan = Instant::now();
         self.last_mask = win::drive_mask();
@@ -600,16 +613,26 @@ impl App {
             return;
         }
         let mt = file_mtime(&config_path());
-        if mt != self.cfg_mtime && self.cfg_error.is_none() {
+        if mt != self.cfg_mtime && self.cfg_error.is_none() && self.save_due.is_none() {
             if let Ok(c) = Config::load() {
                 self.cfg = c;
             }
             self.cfg_mtime = mt;
         }
         self.reload_history_if_changed();
+        self.update_busy();
         if self.last_probe.elapsed() > Duration::from_secs(10) {
             self.probe_tray();
         }
+    }
+
+    fn update_busy(&mut self) {
+        self.busy_drives = self
+            .connected
+            .iter()
+            .map(|(_, r)| r.drive_id.clone())
+            .filter(|id| service::is_busy(id))
+            .collect();
     }
 
     fn probe_tray(&mut self) {
@@ -625,15 +648,25 @@ impl App {
         }
     }
 
+    /// Mark settings as changed; they're written ~0.7 s after the last change
+    /// (and once any drag has ended), so dragging a value doesn't write every frame.
     fn save(&mut self) {
         if let Some(e) = &self.cfg_error {
             self.message = Some((format!("Not saved: {e}"), true));
             return;
         }
+        self.save_due = Some(Instant::now() + Duration::from_millis(700));
+    }
+
+    /// Write pending settings now.
+    fn flush_save(&mut self) {
+        if self.save_due.take().is_none() {
+            return;
+        }
         match self.cfg.save() {
             Ok(()) => {
                 self.cfg_mtime = file_mtime(&config_path());
-                crate::poke_tray();
+                crate::poke_tray(0);
             }
             Err(e) => self.message = Some((e, true)),
         }
@@ -647,16 +680,22 @@ impl App {
         self.job.as_ref().is_some_and(|j| j.shared.lock().unwrap().result.is_none())
     }
 
-    /// (files, bytes) recorded in a connected drive's manifest.
-    fn drive_stat(&mut self, id: &str) -> Option<(u64, u64)> {
-        if let Some(s) = self.drive_stats.get(id) {
+    /// (files, bytes) recorded in a connected drive's manifest. Loaded in the
+    /// background (a big manifest takes a moment to parse); None until ready.
+    fn drive_stat(&mut self, ctx: &egui::Context, id: &str) -> Option<(u64, u64)> {
+        if let Some(s) = self.drive_stats.lock().unwrap().get(id) {
             return Some(*s);
         }
         let root = self.connected_root(id)?;
-        let m = Manifest::load(Path::new(&root));
-        let s = (m.files.len() as u64, m.total_bytes());
-        self.drive_stats.insert(id.to_string(), s);
-        Some(s)
+        if self.drive_stats_pending.insert(id.to_string()) {
+            let (stats, id, ctx) = (self.drive_stats.clone(), id.to_string(), ctx.clone());
+            std::thread::spawn(move || {
+                let m = Manifest::load(Path::new(&root));
+                stats.lock().unwrap().insert(id, (m.files.len() as u64, m.total_bytes()));
+                ctx.request_repaint();
+            });
+        }
+        None
     }
 
     /// Recompute source sizes in the background whenever the source list changes.
@@ -734,9 +773,11 @@ impl App {
         let kind = job.kind;
         let verify = res.verify.take();
         drop(p);
-        self.drive_stats.clear();
+        self.drive_stats.lock().unwrap().clear();
+        self.drive_stats_pending.clear();
         self.reload_history_if_changed();
-        crate::poke_tray();
+        self.update_busy();
+        crate::poke_tray(crate::tray::RELOAD_HISTORY);
         if let Some((name, report)) = verify {
             self.verify_view = Some(VerifyView::new(name, win::now_unix(), report));
         }
@@ -902,6 +943,16 @@ impl App {
 
         self.ui_mark_dialog(&ctx);
         self.ui_confirm(&ctx);
+
+        if let Some(due) = self.save_due {
+            let dragging = ctx.input(|i| i.pointer.any_down());
+            let now = Instant::now();
+            if now >= due && !dragging {
+                self.flush_save();
+            } else {
+                ctx.request_repaint_after(due.saturating_duration_since(now).max(Duration::from_millis(100)));
+            }
+        }
     }
 
     fn ui_job(&mut self, ui: &mut egui::Ui) {
@@ -1322,8 +1373,8 @@ impl App {
     fn ui_drive_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: &str) {
         let Some(reg) = self.cfg.drive(id).cloned() else { return };
         let conn = self.connected.iter().find(|(_, r)| r.drive_id == id).map(|(c, _)| (c.root.clone(), c.space, c.info.clone()));
-        let stats = self.drive_stat(id);
-        let busy = self.job_running() || service::is_busy(id);
+        let stats = self.drive_stat(ctx, id);
+        let busy = self.job_running() || self.busy_drives.contains(id);
         let mut changed = false;
 
         // Header
@@ -1720,14 +1771,16 @@ impl App {
             return;
         }
         let name = (!m.name.trim().is_empty()).then(|| m.name.clone());
+        self.flush_save();
         match service::register_drive(&mut self.cfg, &m.root, name.as_deref()) {
             Ok(r) => {
                 if let Some(d) = self.cfg.drive_mut(&r.drive_id) {
                     d.auto_backup = m.auto_backup;
                 }
                 self.save();
+                self.flush_save();
                 self.selected_drive = Some(r.drive_id.clone());
-                crate::poke_tray();
+                crate::poke_tray(crate::tray::RELOAD_DRIVES);
                 self.message = Some((format!("\"{}\" ({}) is now a backup drive. Click \"Back up now\" to make the first backup.", r.name, &m.root[..2]), false));
                 self.refresh();
             }
@@ -2294,6 +2347,12 @@ impl App {
             });
         }
 
+        ui.add_space(8.0);
+        if ui.button("Uninstall SyncApp...").clicked() {
+            self.uninstall_remove_data = false;
+            self.confirm = Some(Confirm::Uninstall);
+        }
+
         ui.add_space(14.0);
         ui.heading("Files");
         ui.horizontal(|ui| {
@@ -2324,6 +2383,10 @@ impl App {
     fn ui_confirm(&mut self, ctx: &egui::Context) {
         let Some(c) = &self.confirm else { return };
         let (title, body) = match c {
+            Confirm::Uninstall => (
+                "Uninstall SyncApp?".to_string(),
+                "This stops the background service, removes it from Windows startup and the Start menu, and deletes the installed program. Backups on your drives are NOT touched.".to_string(),
+            ),
             Confirm::Unregister { name, .. } => (
                 format!("Stop using \"{name}\"?"),
                 "SyncApp will no longer back up to this drive. Files already on it are NOT deleted.".to_string(),
@@ -2338,10 +2401,16 @@ impl App {
             ),
         };
         let mut answer = None;
+        let is_uninstall = matches!(c, Confirm::Uninstall);
+        let remove_data = &mut self.uninstall_remove_data;
         egui::Modal::new(egui::Id::unique("syncapp-confirm")).show(ctx, |ui| {
             ui.set_width(400.0);
             ui.heading(title);
             ui.label(body);
+            if is_uninstall {
+                ui.add_space(6.0);
+                ui.checkbox(remove_data, "Also delete SyncApp's settings, history and log on this PC");
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("Yes").clicked() {
@@ -2358,11 +2427,14 @@ impl App {
             return;
         }
         match c {
-            Confirm::Unregister { id, name } => match service::unregister_drive(&mut self.cfg, &id) {
+            Confirm::Unregister { id, name } => match {
+                self.flush_save();
+                service::unregister_drive(&mut self.cfg, &id)
+            } {
                 Ok(()) => {
                     self.cfg_mtime = file_mtime(&config_path());
                     self.message = Some((format!("\"{name}\" is no longer a backup drive."), false));
-                    crate::poke_tray();
+                    crate::poke_tray(crate::tray::RELOAD_DRIVES);
                     self.selected_drive = None;
                     self.refresh();
                 }
@@ -2378,7 +2450,26 @@ impl App {
                 self.save();
             }
             Confirm::RestoreOverwrite(files, desc) => self.restore_files(ctx, files, desc),
+            Confirm::Uninstall => {
+                self.flush_save();
+                match crate::uninstall(self.uninstall_remove_data) {
+                    Ok(msg) => {
+                        self.message = Some((msg, false));
+                        self.autostart = false;
+                        self.save_due = None;
+                        // Nothing left to manage: close the window.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => self.message = Some((format!("Uninstall failed: {e}"), true)),
+                }
+            }
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.flush_save(); // don't lose a change made just before closing
     }
 }
 

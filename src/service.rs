@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{data_dir, Config, DriveReg};
+use crate::config::{data_dir, Config, DriveReg, SourceKind};
 use crate::engine::{self, Progress, Report, VerifyReport, META_DIR};
 use crate::win::{self, NamedLock};
 
@@ -216,19 +216,29 @@ pub fn restore_files(
 }
 
 /// Where a backed-up file originally lived on this PC, if its source is still configured.
+///
+/// Works even when the source has since been deleted from the PC (the usual reason to
+/// restore): the source's recorded kind decides; for old configs without one, a key whose
+/// remainder is exactly the source's own file name means a single-file source, anything
+/// else means a folder.
 pub fn original_path(cfg: &Config, key: &str) -> Option<PathBuf> {
     let (name, rel) = key.split_once('/')?;
     let src = cfg.sources.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
-    if src.path.is_dir() {
-        Some(engine::dest_path(&src.path, rel))
-    } else {
+    let file_name = src.path.file_name()?.to_string_lossy().into_owned();
+    let is_file = match src.kind() {
+        Some(SourceKind::File) => true,
+        Some(SourceKind::Folder) => false,
+        None => rel.eq_ignore_ascii_case(&file_name),
+    };
+    if is_file {
         // Single-file source: backed up as "<name>/<file name>".
-        let file_name = src.path.file_name()?.to_string_lossy();
         if rel.eq_ignore_ascii_case(&file_name) {
             Some(src.path.clone())
         } else {
             src.path.parent().map(|p| engine::dest_path(p, rel))
         }
+    } else {
+        Some(engine::dest_path(&src.path, rel))
     }
 }
 

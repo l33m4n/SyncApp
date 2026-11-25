@@ -9,7 +9,7 @@
 //!   a crash can never leave a broken or missing backup of a file.
 //! * If nothing changed since the last backup, nothing is written to the drive.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::MetadataExt;
@@ -146,7 +146,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let res = (|| {
-        let mut f = File::create(&tmp)?;
+        let _ = fs::remove_file(&tmp); // removes a planted link itself, never its target
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -275,6 +276,10 @@ impl From<io::Error> for Fail {
         // ERROR_DISK_FULL (112) / ERROR_HANDLE_DISK_FULL (39)
         match e.raw_os_error() {
             Some(112) | Some(39) => Fail::Fatal("drive is full".into()),
+            // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+            Some(32) | Some(33) => Fail::File(
+                "in use by another program that has it locked; the previous backup copy was kept and it will be retried next time".into(),
+            ),
             _ => Fail::File(e.to_string()),
         }
     }
@@ -465,6 +470,10 @@ pub fn decide(src: Stamp, dest: Option<Stamp>, entry: Option<&Entry>) -> Option<
 struct CopyCtx<'a> {
     /// Where free space is checked (destination volume).
     space_root: PathBuf,
+    /// When writing to a backup drive: the drive root. Folders under it are created
+    /// one by one and must be real folders, never junctions or links.
+    guard: Option<PathBuf>,
+    safe_dirs: HashSet<PathBuf>,
     fat32: bool,
     cancel: &'a AtomicBool,
     bytes_done: u64,
@@ -486,7 +495,15 @@ fn copy_verified(
     progress: Progress,
 ) -> Result<(String, Stamp, Stamp), Fail> {
     let parent = dest.parent().ok_or_else(|| Fail::File("bad destination".into()))?;
-    fs::create_dir_all(parent)?;
+    match &ctx.guard {
+        Some(root) => {
+            ensure_real_dirs(root, parent, &mut ctx.safe_dirs)?;
+            if fs::symlink_metadata(dest).is_ok_and(|m| is_reparse(&m)) {
+                return Err(Fail::File(format!("refusing to replace a link at {}", dest.display())));
+            }
+        }
+        None => fs::create_dir_all(parent)?,
+    }
     let tmp = parent.join(format!(".{}{TMP_SUFFIX}", dest.file_name().unwrap().to_string_lossy()));
     let mut buf = vec![0u8; CHUNK];
     let start_done = ctx.bytes_done;
@@ -512,7 +529,8 @@ fn copy_verified(
 
         let attempt = (|| -> Result<Option<(String, Stamp, Stamp)>, Fail> {
             let mut fi = File::open(src)?;
-            let mut fo = File::create(&tmp)?;
+            let _ = fs::remove_file(&tmp); // leftover from an interrupted copy, or a planted link
+            let mut fo = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             let mut h = blake3::Hasher::new();
             loop {
                 if ctx.cancel.load(Ordering::Relaxed) {
@@ -570,6 +588,68 @@ fn copy_verified(
     Err(Fail::File("file kept changing while being copied; will retry next backup".into()))
 }
 
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+fn is_reparse(md: &fs::Metadata) -> bool {
+    md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Create `dir` (under `root`) one folder at a time, refusing to go through any junction,
+/// symlink or other reparse point. Stops a tampered backup drive from redirecting
+/// SyncApp's writes somewhere else, such as a folder on the PC.
+fn ensure_real_dirs(root: &Path, dir: &Path, safe: &mut HashSet<PathBuf>) -> Result<(), Fail> {
+    if safe.contains(dir) {
+        return Ok(());
+    }
+    let rel = dir.strip_prefix(root).map_err(|_| Fail::File(format!("{} is outside the drive", dir.display())))?;
+    let mut p = root.to_path_buf();
+    for c in rel.components() {
+        p.push(c);
+        if safe.contains(&p) {
+            continue;
+        }
+        match fs::symlink_metadata(&p) {
+            Ok(md) if is_reparse(&md) => {
+                return Err(Fail::File(format!(
+                    "refusing to write through a junction or link at {} (the drive may have been tampered with)",
+                    p.display()
+                )));
+            }
+            Ok(md) if !md.is_dir() => return Err(Fail::File(format!("{} is not a folder", p.display()))),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&p)?,
+            Err(e) => return Err(e.into()),
+        }
+        safe.insert(p.clone());
+    }
+    Ok(())
+}
+
+const IN_PROGRESS: &str = "backup-in-progress";
+
+/// Delete SyncApp temp files left behind by an interrupted backup (e.g. drive unplugged
+/// mid-copy). Only runs after an interruption, so normal backups pay nothing.
+fn sweep_temp_files(dir: &Path) -> usize {
+    let mut removed = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            } else if ft.is_dir() {
+                stack.push(e.path());
+            } else if e.file_name().to_string_lossy().to_lowercase().ends_with(TMP_SUFFIX)
+                && fs::remove_file(e.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 fn is_fat32(root: &Path) -> bool {
     crate::win::volume_info(root).is_some_and(|v| v.fs_name.eq_ignore_ascii_case("FAT32") || v.fs_name.eq_ignore_ascii_case("FAT"))
 }
@@ -603,8 +683,40 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
     let bytes_total: u64 = plan.iter().map(|p| p.0.stamp.size).sum();
     progress(Event::Planned { files: plan.len(), bytes: bytes_total });
 
+    let meta_dir = drive_root.join(META_DIR);
+    let in_progress = meta_dir.join(IN_PROGRESS);
+    let mut safe_dirs = HashSet::new();
+    // A previous backup was interrupted: clear out its temp files.
+    if in_progress.exists() {
+        let n = sweep_temp_files(&backup_dir);
+        if n > 0 {
+            crate::info!("Removed {n} leftover temp file(s) from an interrupted backup");
+        }
+        let _ = fs::remove_file(&in_progress);
+    }
+    if !plan.is_empty() {
+        // Our own metadata folder must be a real folder too.
+        if let Err(e) = ensure_real_dirs(drive_root, &meta_dir, &mut safe_dirs) {
+            report.aborted = Some(e.to_string());
+            report.duration_ms = t0.elapsed().as_millis() as u64;
+            return report;
+        }
+        let _ = atomic_write(&in_progress, b"1");
+    }
+
     // Phase 2: act on the (usually short) list of candidates.
-    let mut ctx = CopyCtx { space_root: drive_root.to_path_buf(), fat32: is_fat32(drive_root), cancel, bytes_done: 0, bytes_total };
+    let mut ctx = CopyCtx {
+        space_root: drive_root.to_path_buf(),
+        guard: Some(drive_root.to_path_buf()),
+        safe_dirs,
+        fat32: is_fat32(drive_root),
+        cancel,
+        bytes_done: 0,
+        bytes_total,
+    };
+    // Rewriting a big manifest is costly on a USB stick: save less often as it grows
+    // (20 s, plus 2 s per 1,000 files).
+    let save_every = MANIFEST_SAVE_EVERY + Duration::from_millis(manifest.files.len() as u64 * 2);
     let mut last_save = Instant::now();
     let total = plan.len();
     for (i, (it, dest, action)) in plan.iter().enumerate() {
@@ -641,7 +753,7 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
                 report.failed.push((it.key.clone(), msg));
             }
         }
-        if manifest.dirty && last_save.elapsed() > MANIFEST_SAVE_EVERY {
+        if manifest.dirty && last_save.elapsed() > save_every {
             let _ = manifest.save();
             last_save = Instant::now();
         }
@@ -650,6 +762,10 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
         if let Err(e) = manifest.save() {
             crate::warn!("Could not save manifest: {e}");
         }
+    }
+    // Finished (even if stopped early, temp files were cleaned up as we went).
+    if drive_root.exists() {
+        let _ = fs::remove_file(&in_progress);
     }
     report.duration_ms = t0.elapsed().as_millis() as u64;
     report
@@ -790,7 +906,7 @@ pub fn verify_drive(drive_root: &Path, cancel: &AtomicBool, progress: Option<Pro
         r.untracked = files.into_iter().filter(|f| f.hash.is_none()).map(|f| f.key).collect();
     }
     let bad: Vec<String> = r.corrupted.iter().chain(r.missing.iter()).cloned().collect();
-    if !bad.is_empty() {
+    if !bad.is_empty() && ensure_real_dirs(drive_root, &drive_root.join(META_DIR), &mut HashSet::new()).is_ok() {
         for k in &bad {
             m.files.remove(k);
         }
@@ -864,7 +980,15 @@ pub fn restore_files(
     }).collect();
     let bytes_total = srcs.iter().filter_map(|s| s.1).map(|s| s.size).sum();
     progress(Event::Planned { files: files.len(), bytes: bytes_total });
-    let mut ctx = CopyCtx { space_root: PathBuf::new(), fat32: false, cancel, bytes_done: 0, bytes_total };
+    let mut ctx = CopyCtx {
+        space_root: PathBuf::new(),
+        guard: None, // restoring onto the PC: the user picked the destination
+        safe_dirs: HashSet::new(),
+        fat32: false,
+        cancel,
+        bytes_done: 0,
+        bytes_total,
+    };
     let mut fat_cache: std::collections::HashMap<String, bool> = Default::default();
     for (i, ((key, dest), (src, src_stamp))) in files.iter().zip(srcs.iter()).enumerate() {
         progress(Event::File { index: i + 1, total: files.len(), key });

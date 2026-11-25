@@ -25,6 +25,32 @@ pub struct Source {
     pub exclude: Vec<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Folder or single file. Recorded when added, so restores still know where
+    /// files belong after the source itself has been deleted from the PC.
+    #[serde(default)]
+    pub kind: Option<SourceKind>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Folder,
+    File,
+}
+
+impl Source {
+    /// Folder or file: the recorded kind, else whatever is on disk now, else None.
+    pub fn kind(&self) -> Option<SourceKind> {
+        self.kind.or_else(|| {
+            if self.path.is_dir() {
+                Some(SourceKind::Folder)
+            } else if self.path.is_file() {
+                Some(SourceKind::File)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -96,6 +122,12 @@ impl Config {
             Ok(bytes) => {
                 let mut cfg: Config = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("Settings file {} is invalid: {e}", path.display()))?;
+                // Older configs didn't record whether a source is a folder or a file.
+                for src in cfg.sources.iter_mut() {
+                    if src.kind.is_none() {
+                        src.kind = src.kind();
+                    }
+                }
                 for d in cfg.drives.iter_mut() {
                     if d.schedule.is_off() && d.repeat_minutes > 0 {
                         d.schedule = Schedule::Every { minutes: d.repeat_minutes };
@@ -162,7 +194,8 @@ impl Config {
         if self.sources.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
             return Err(format!("A source named '{name}' already exists"));
         }
-        let src = Source { name, path, exclude, enabled: true };
+        let kind = Some(if path.is_dir() { SourceKind::Folder } else { SourceKind::File });
+        let src = Source { name, path, exclude, enabled: true, kind };
         self.sources.push(src.clone());
         Ok(src)
     }

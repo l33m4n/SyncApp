@@ -60,12 +60,13 @@ pub fn tray_running() -> bool {
     !matches!(NamedLock::try_acquire(tray::TRAY_LOCK), Ok(Some(_)))
 }
 
-/// Tell the background service that settings or history changed (cheap; no polling needed).
-pub fn poke_tray() {
+/// Tell the background service that settings changed (cheap; no polling needed).
+/// `flags`: tray::RELOAD_DRIVES and/or tray::RELOAD_HISTORY for what else changed.
+pub fn poke_tray(flags: usize) {
     unsafe {
         let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
         if !h.is_null() {
-            PostMessageW(h, tray::WM_SYNCAPP_RELOAD, 0, 0);
+            PostMessageW(h, tray::WM_SYNCAPP_RELOAD, flags, 0);
         }
     }
 }
@@ -91,26 +92,14 @@ pub fn install() -> Result<String, String> {
     let target = dir.join(EXE_NAME);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    // Ask the running background service to exit so its exe can be replaced.
-    unsafe {
-        let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
-        if !h.is_null() {
-            PostMessageW(h, WM_CLOSE, 0, 0);
-        }
-    }
-    let t0 = Instant::now();
-    while tray_running() {
-        if t0.elapsed() > Duration::from_secs(10) {
-            return Err("the background service is busy with a backup; try again when it finishes".into());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // The running background service must exit so its exe can be replaced.
+    stop_tray()?;
 
     std::fs::copy(&exe, &target).map_err(|e| format!("copying to {}: {e}", target.display()))?;
     win::set_autostart(Some(&format!("\"{}\" --tray", target.display()))).map_err(|e| e.to_string())?;
 
     // Start menu shortcut (WScript.Shell via PowerShell; values passed as env vars, not code).
-    let programs = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join(r"Microsoft\Windows\Start Menu\Programs");
+    let programs = start_menu_dir();
     let _ = Command::new("powershell.exe")
         .args([
             "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
@@ -128,6 +117,58 @@ pub fn install() -> Result<String, String> {
         "Installed to {}. SyncApp now starts with Windows and is in your Start menu. You can delete the copy you ran this from.",
         dir.display()
     ))
+}
+
+fn start_menu_dir() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join(r"Microsoft\Windows\Start Menu\Programs")
+}
+
+/// Ask the background service to exit and wait for it (it refuses while a backup runs).
+fn stop_tray() -> Result<(), String> {
+    unsafe {
+        let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
+        if !h.is_null() {
+            PostMessageW(h, WM_CLOSE, 0, 0);
+        }
+    }
+    let t0 = Instant::now();
+    while tray_running() {
+        if t0.elapsed() > Duration::from_secs(10) {
+            return Err("the background service is busy with a backup; try again when it finishes".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// Remove SyncApp from this PC: background service, startup entry, Start menu shortcut
+/// and installed program. Backups on drives are never touched. With `remove_data`,
+/// settings, history and the log are deleted too.
+pub fn uninstall(remove_data: bool) -> Result<String, String> {
+    stop_tray()?;
+    syncapp::info!("Uninstalling (remove settings: {remove_data})");
+    win::set_autostart(None).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(start_menu_dir().join("SyncApp.lnk"));
+
+    let dir = install_dir();
+    let exe = std::env::current_exe().unwrap_or_default();
+    if dir.exists() {
+        if exe.starts_with(&dir) {
+            // Can't delete a running exe: remove the folder a moment after this window closes.
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("cmd.exe")
+                .raw_arg(format!("/C ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display()))
+                .creation_flags_no_window()
+                .spawn();
+        } else {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("removing {}: {e}", dir.display()))?;
+        }
+    }
+    if remove_data {
+        let _ = std::fs::remove_dir_all(syncapp::config::config_dir());
+        let _ = std::fs::remove_dir_all(syncapp::config::data_dir());
+    }
+    Ok("SyncApp has been uninstalled. Your backups on your drives are untouched.".into())
 }
 
 trait NoWindow {

@@ -34,8 +34,22 @@ use syncapp::{info, warn};
 
 pub const TRAY_LOCK: &str = "Local\\SyncApp-Tray";
 pub const TRAY_CLASS: &str = "SyncAppTrayHost";
-/// Posted by the manager window when settings or history changed.
+/// Posted by the manager window when settings changed. WPARAM flags say what else changed.
 pub const WM_SYNCAPP_RELOAD: u32 = WM_APP + 2;
+/// A drive was marked or unmarked: re-identify plugged-in drives.
+pub const RELOAD_DRIVES: usize = 1;
+/// A backup/verify/restore finished: re-read last-backup times.
+pub const RELOAD_HISTORY: usize = 2;
+/// How long an automatic backup waits for a drive the manager window is busy with.
+const MAX_WAIT_FOR_BUSY: Duration = Duration::from_secs(30 * 60);
+
+/// Why a backup is running; decides priority and how chatty notifications are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    PlugIn,
+    Scheduled,
+    Manual,
+}
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_BACKUP_DONE: u32 = WM_APP + 3;
@@ -72,6 +86,8 @@ struct State {
     last_attempt: HashMap<String, Instant>,
     /// Unix time of each drive's last completed backup (from history, then kept up to date).
     last_backup: HashMap<String, u64>,
+    /// Files that failed in each drive's last backup (to avoid repeating the same warning).
+    last_failed: HashMap<String, Vec<String>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -84,6 +100,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         busy: Vec::new(),
         last_attempt: HashMap::new(),
         last_backup: HashMap::new(),
+        last_failed: HashMap::new(),
         workers: Vec::new(),
     })
 });
@@ -254,8 +271,17 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_SYNCAPP_RELOAD => {
                 reload_config(true);
-                rescan_backup_drives();
-                state().last_backup = service::last_backups();
+                if wp & RELOAD_DRIVES != 0 {
+                    // Rare (a drive was marked/unmarked): the only time all drives are re-read.
+                    rescan_backup_drives();
+                } else {
+                    let mut st = state();
+                    let ids: Vec<String> = st.cfg.drives.iter().map(|d| d.drive_id.clone()).collect();
+                    st.backup_drives.retain(|_, id| ids.contains(id));
+                }
+                if wp & RELOAD_HISTORY != 0 {
+                    state().last_backup = service::last_backups();
+                }
                 reschedule();
                 0
             }
@@ -385,7 +411,7 @@ unsafe fn on_command(h: HWND, id: u16) {
                 notify("SyncApp", "No marked backup drive is connected.", false);
             }
             for (root, reg) in drives {
-                start_backup(cfg.clone(), root, reg, false);
+                start_backup(cfg.clone(), root, reg, Trigger::Manual);
             }
         }
         ID_PAUSE => {
@@ -452,7 +478,7 @@ fn drives_changed() {
                         info!("Drive '{}' connected at {root} (automatic backups paused)", reg.name);
                     } else {
                         info!("Drive '{}' connected at {root}", reg.name);
-                        start_backup(cfg.clone(), root, reg, true);
+                        start_backup(cfg.clone(), root, reg, Trigger::PlugIn);
                     }
                 }
                 Identity::SerialMismatch(reg) => {
@@ -554,16 +580,16 @@ fn run_due_schedules() {
     let cfg = cfg();
     for (root, reg) in due {
         info!("Scheduled backup to '{}' ({})", reg.name, reg.schedule.describe());
-        start_backup(cfg.clone(), root, reg, true);
+        start_backup(cfg.clone(), root, reg, Trigger::Scheduled);
     }
     reschedule();
 }
 
 // ------------------------------------------------------------------ backups
 
-/// Run a backup on a worker thread. Automatic (`background`) backups use low disk and
-/// memory priority so they don't slow down whatever you're doing.
-fn start_backup(cfg: Config, root: String, reg: DriveReg, background: bool) {
+/// Run a backup on a worker thread. Automatic backups (plug-in and scheduled) use low disk
+/// and memory priority so they don't slow down whatever you're doing.
+fn start_backup(cfg: Config, root: String, reg: DriveReg, trigger: Trigger) {
     {
         let mut st = state();
         if st.busy.iter().any(|b| b.0 == reg.drive_id) {
@@ -574,7 +600,7 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg, background: bool) {
     update_tip();
     let handle = std::thread::spawn(move || {
         win::thread_full_speed();
-        if background {
+        if trigger != Trigger::Manual {
             win::thread_background_mode();
         }
         let notify_on = cfg.notifications;
@@ -603,26 +629,54 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg, background: bool) {
             _ => {}
         };
 
-        let mut result = Err(String::new());
-        for _ in 0..3 {
-            result = service::backup_drive(&cfg, &root, &reg, &CANCEL, Some(&mut cb));
-            match &result {
-                Err(e) if e.contains("already running") => std::thread::sleep(Duration::from_secs(3)),
-                _ => break,
+        // If the manager window is verifying or restoring this drive, wait for it
+        // (while the drive stays plugged in) instead of skipping the backup.
+        let started = Instant::now();
+        let mut said_waiting = false;
+        let result = loop {
+            let r = service::backup_drive(&cfg, &root, &reg, &CANCEL, Some(&mut cb));
+            match &r {
+                Err(e)
+                    if e.contains("already running")
+                        && !CANCEL.load(Ordering::Relaxed)
+                        && started.elapsed() < MAX_WAIT_FOR_BUSY
+                        && Path::new(&root).exists() =>
+                {
+                    if !said_waiting {
+                        info!("'{}' is busy; waiting to back it up", reg.name);
+                        set_status(format!("Waiting for {} (busy)...", reg.name));
+                        said_waiting = true;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                _ => break r,
             }
-        }
+        };
         let completed = result.is_ok();
+        let first_failure = !state().last_attempt.contains_key(&reg.drive_id);
         match result {
             Ok(r) => {
                 let (title, body, problem) = service::describe(&reg, &root, &r);
-                if notify_on || problem {
+                // Scheduled runs that found nothing to do stay silent, and don't repeat a
+                // warning about exactly the same files as last time (e.g. one that's always open).
+                let mut failed: Vec<String> = r.failed.iter().map(|f| f.0.clone()).collect();
+                failed.extend(r.missing_sources.iter().cloned());
+                failed.sort();
+                let same_problem = state().last_failed.insert(reg.drive_id.clone(), failed.clone()) == Some(failed)
+                    && r.aborted.is_none();
+                let quiet = trigger == Trigger::Scheduled && r.copied.is_empty();
+                let repeat_warning = trigger == Trigger::Scheduled && same_problem;
+                if (problem && !repeat_warning) || (notify_on && !quiet && !problem) {
                     notify(&title, &body, problem);
                 }
             }
             Err(e) if e.contains("already running") => info!("Skipped '{}': {e}", reg.name),
             Err(e) => {
                 warn!("Backup to '{}' did not run: {e}", reg.name);
-                notify(&format!("Backup to {} didn't run", reg.name), &e, true);
+                // A scheduled backup that keeps failing is announced once, not every retry.
+                if trigger != Trigger::Scheduled || first_failure {
+                    notify(&format!("Backup to {} didn't run", reg.name), &e, true);
+                }
             }
         }
         {

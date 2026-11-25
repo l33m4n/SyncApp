@@ -172,8 +172,35 @@ pub fn local_clock() -> crate::schedule::Clock {
     unsafe { GetLocalTime(&mut t) };
     crate::schedule::Clock {
         now: now_unix(),
-        secs_today: t.wHour as u64 * 3600 + t.wMinute as u64 * 60 + t.wSecond as u64,
-        weekday: ((t.wDayOfWeek + 6) % 7) as u8, // Windows: 0 = Sunday
+        day: crate::schedule::days_from_civil(t.wYear as i64, t.wMonth as u32, t.wDay as u32),
+        to_unix: local_to_unix,
+    }
+}
+
+/// Local calendar day + minute of day -> Unix seconds, using Windows' time-zone rules
+/// for that date (so a 09:00 slot stays at 09:00 across daylight-saving changes).
+pub fn local_to_unix(day: i64, minute: u16) -> u64 {
+    use windows_sys::Win32::System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
+    let (y, m, d) = crate::schedule::civil_from_days(day);
+    let local = SYSTEMTIME {
+        wYear: y as u16,
+        wMonth: m as u16,
+        wDayOfWeek: 0,
+        wDay: d as u16,
+        wHour: minute / 60,
+        wMinute: minute % 60,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    unsafe {
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        let mut ft: FILETIME = std::mem::zeroed();
+        if TzSpecificLocalTimeToSystemTime(null(), &local, &mut utc) == 0 || SystemTimeToFileTime(&utc, &mut ft) == 0 {
+            // Fall back to treating it as UTC rather than failing.
+            return (day * 86_400 + minute as i64 * 60).max(0) as u64;
+        }
+        let ticks = (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64;
+        (ticks / 10_000_000).saturating_sub(11_644_473_600)
     }
 }
 

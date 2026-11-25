@@ -39,8 +39,8 @@ fn set_mtime(p: &Path, t: SystemTime) {
 
 fn sources(e: &Env) -> Vec<Source> {
     vec![
-        Source { name: "Docs".into(), path: e.pc.join("docs"), exclude: vec!["*.log".into()], enabled: true },
-        Source { name: "One".into(), path: e.pc.join("single.txt"), exclude: vec![], enabled: true },
+        Source { name: "Docs".into(), path: e.pc.join("docs"), exclude: vec!["*.log".into()], enabled: true, kind: None },
+        Source { name: "One".into(), path: e.pc.join("single.txt"), exclude: vec![], enabled: true, kind: None },
     ]
 }
 
@@ -250,7 +250,7 @@ fn restore_refuses_corrupted_backup() {
 fn missing_source_is_reported_not_fatal() {
     let e = env();
     let mut s = sources(&e);
-    s.push(Source { name: "Gone".into(), path: e.pc.join("nope"), exclude: vec![], enabled: true });
+    s.push(Source { name: "Gone".into(), path: e.pc.join("nope"), exclude: vec![], enabled: true, kind: None });
     let no = AtomicBool::new(false);
     let r = engine::run_backup(&s, &e.drive, &no, None);
     assert_eq!(r.missing_sources.len(), 1);
@@ -309,4 +309,93 @@ fn verify_report_lists_every_file_with_checksums() {
     // Missing file is re-copied by the next backup.
     let r = backup(&e);
     assert_eq!(r.copied, vec!["One/single.txt".to_string()]);
+}
+
+#[test]
+fn refuses_to_write_through_a_junction_on_the_drive() {
+    let e = env();
+    // A tampered drive: "SyncApp Backup\Docs" is a junction pointing somewhere else.
+    let elsewhere = e.pc.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(e.drive.join(BACKUP_DIR)).unwrap();
+    let link = e.drive.join(BACKUP_DIR).join("Docs");
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&elsewhere)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "could not create a junction for the test");
+
+    let r = backup(&e);
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing may be written through the junction");
+    assert!(r.failed.iter().any(|(k, m)| k.starts_with("Docs/") && m.contains("junction")), "{r:?}");
+    // Other sources are still backed up.
+    assert!(r.copied.contains(&"One/single.txt".to_string()));
+}
+
+#[test]
+fn leftover_temp_files_are_swept_after_an_interrupted_backup() {
+    let e = env();
+    backup(&e);
+    // Simulate a drive pulled mid-copy: an orphan temp file plus the in-progress marker.
+    let orphan = on_drive(&e, "Docs/sub/.gone.bin.syncapp-tmp");
+    write(&orphan, b"half a file");
+    write(&e.drive.join(".syncapp").join("backup-in-progress"), b"1");
+    let r = backup(&e); // nothing changed on the PC
+    assert!(r.copied.is_empty());
+    assert!(!orphan.exists(), "orphaned temp file should be removed");
+    assert!(!e.drive.join(".syncapp").join("backup-in-progress").exists());
+    // And with no interruption, an unchanged backup still writes nothing.
+    let before = snapshot(&e.drive);
+    backup(&e);
+    assert_eq!(snapshot(&e.drive), before);
+}
+
+#[test]
+fn exclusively_locked_file_is_reported_and_old_backup_kept() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let e = env();
+    backup(&e);
+    write(&e.pc.join("docs/a.txt"), b"new version, locked by an app");
+    // Simulate an app holding the file open with no sharing (like Outlook with a .pst).
+    let _lock = OpenOptions::new().read(true).share_mode(0).open(e.pc.join("docs/a.txt")).unwrap();
+    let r = backup(&e);
+    assert_eq!(r.failed.len(), 1, "{r:?}");
+    assert!(r.failed[0].0 == "Docs/a.txt");
+    assert!(r.failed[0].1.contains("in use"), "message should say the file is in use: {}", r.failed[0].1);
+    // The previous backup copy is untouched and other files were still processed.
+    assert_eq!(fs::read(on_drive(&e, "Docs/a.txt")).unwrap(), b"alpha");
+    drop(_lock);
+    // Once the app closes it, the next backup picks it up.
+    let r = backup(&e);
+    assert_eq!(r.copied, vec!["Docs/a.txt".to_string()]);
+}
+
+#[test]
+fn file_changed_between_scan_and_copy_is_copied_as_its_latest_version() {
+    let e = env();
+    backup(&e);
+    write(&e.pc.join("docs/a.txt"), b"edit 1");
+    let no = AtomicBool::new(false);
+    let path = e.pc.join("docs/a.txt");
+    let mut edited = false;
+    // Edit the file again right after the scan, before it's copied.
+    let mut cb = |ev: engine::Event| {
+        if let engine::Event::Planned { .. } = ev {
+            if !edited {
+                write(&path, b"edit 2, saved mid-backup");
+                set_mtime(&path, SystemTime::now() + Duration::from_secs(30));
+                edited = true;
+            }
+        }
+    };
+    let r = engine::run_backup(&sources(&e), &e.drive, &no, Some(&mut cb));
+    assert!(r.ok(), "{r:?}");
+    assert_eq!(fs::read(on_drive(&e, "Docs/a.txt")).unwrap(), b"edit 2, saved mid-backup");
+    // And the manifest matches what's on the drive: the next run sees no changes.
+    let r = backup(&e);
+    assert!(r.copied.is_empty() && r.refreshed == 0, "{r:?}");
 }

@@ -7,19 +7,20 @@ Pick the folders and files you care about, mark the drives you trust, and SyncAp
 - **Only marked drives**: each backup drive carries a hidden random ID, and that ID is checked against the drive's volume serial number. A random USB stick, or a copied ID file, never receives your files.
 - **Only what changed**: unchanged files are recognised from metadata alone. If nothing changed, nothing is written to the drive.
 - **No data loss**: every copy is written to a temp file, flushed to the device, read back and checksum-verified (BLAKE3) before it replaces the previous copy. Unplugging mid-backup, a full drive or a crash can never damage an existing backup. Nothing on the drive is ever deleted, and files on the PC are only read.
-- **Lightweight**: one ~6 MB `SyncApp.exe` with no runtime. The background service idles at about 10 MB of RAM. The manager window only runs while it's open.
+- **Tamper-resistant**: SyncApp never writes through junctions or symbolic links on a backup drive, so a modified drive can't redirect writes onto your PC.
+- **Lightweight**: one ~6 MB `SyncApp.exe` with no runtime. The background service is event-driven and idles at ~0% CPU, no disk access and about 2 MB of memory, in Windows' efficiency mode. Automatic backups run at background disk priority. The manager window only runs while it's open.
 
 ## Using it
 
 1. Run `SyncApp.exe`. The manager window opens and the background service (tray icon) starts.
 2. **What to back up**: add folders or individual files. You can add skip patterns such as `*.iso` or `node_modules`.
-3. **Backup drives**: plug in a drive and click **Mark as backup drive**.
+3. **Backup drives**: plug in a drive and click **Use as backup drive...**.
 4. Done. Whenever that drive is plugged in, changed files are copied and a notification tells you when it's safe to unplug.
-5. **Settings > Install** copies SyncApp to `%LOCALAPPDATA%\Programs\SyncApp`, adds a Start menu entry and starts it at sign-in.
+5. **Settings > Install** copies SyncApp to `%LOCALAPPDATA%\Programs\SyncApp`, adds a Start menu entry and starts it at sign-in. **Settings > Uninstall** removes all of that again (backups on your drives are never touched).
 
 Other features:
 
-- **Per-drive options**: choose which sources go to which drive, turn automatic backup off, or repeat the backup every N minutes while the drive stays plugged in.
+- **Per-drive options**: choose which sources go to which drive, turn automatic backup off, and schedule extra backups while the drive stays plugged in (every N minutes/hours, or at set times of day on chosen weekdays). Scheduled runs only notify you when they copied something or hit a problem.
 - **Verify integrity**: re-reads every file on the drive and checks it against the checksum recorded at backup time. Corrupted files are re-copied on the next backup.
 - **Restore**: copy a backup to its original location or to another folder. Existing files are only replaced if you tick the option.
 - **History**: every backup, verify and restore, with any per-file problems.

@@ -21,16 +21,47 @@ pub enum Schedule {
 pub struct Clock {
     /// Unix seconds.
     pub now: u64,
-    /// Seconds since local midnight.
-    pub secs_today: u64,
-    /// 0 = Monday ... 6 = Sunday.
-    pub weekday: u8,
+    /// Today's local calendar date, as days since 1970-01-01.
+    pub day: i64,
+    /// Converts (local calendar day, minute of that day) to Unix seconds using the
+    /// real time-zone rules for that date, so daylight-saving changes are honoured.
+    pub to_unix: fn(i64, u16) -> u64,
 }
 
 impl Clock {
     pub fn now() -> Clock {
         crate::win::local_clock()
     }
+}
+
+/// 0 = Monday ... 6 = Sunday for a day number (1970-01-01 was a Thursday).
+pub fn weekday_of(day: i64) -> u8 {
+    (day + 3).rem_euclid(7) as u8
+}
+
+/// Days since 1970-01-01 for a calendar date (proleptic Gregorian).
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Calendar date (year, month, day) for a day number.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
 }
 
 pub const MIN_INTERVAL: u32 = 5;
@@ -57,10 +88,10 @@ impl Schedule {
         Schedule::Daily { times, days: (0..7).collect() }
     }
 
-    fn slots_on(&self, day_start: u64, weekday: u8) -> Vec<u64> {
+    fn slots_on(&self, day: i64, c: &Clock) -> Vec<u64> {
         match self {
-            Schedule::Daily { times, days } if days.contains(&weekday) => {
-                let mut v: Vec<u64> = times.iter().map(|t| day_start + *t as u64 * 60).collect();
+            Schedule::Daily { times, days } if days.contains(&weekday_of(day)) => {
+                let mut v: Vec<u64> = times.iter().map(|t| (c.to_unix)(day, *t)).collect();
                 v.sort();
                 v
             }
@@ -70,21 +101,12 @@ impl Schedule {
 
     /// Most recent scheduled moment at or before now.
     fn latest_slot(&self, c: &Clock) -> Option<u64> {
-        let midnight = c.now - c.secs_today;
-        (0..=7u64).find_map(|d| {
-            let day_start = midnight.checked_sub(d * 86_400)?;
-            let wd = ((c.weekday as u64 + 7 - d % 7) % 7) as u8;
-            self.slots_on(day_start, wd).into_iter().rev().find(|s| *s <= c.now)
-        })
+        (0..=7i64).find_map(|d| self.slots_on(c.day - d, c).into_iter().rev().find(|s| *s <= c.now))
     }
 
     /// Next scheduled moment after now.
     fn next_slot(&self, c: &Clock) -> Option<u64> {
-        let midnight = c.now - c.secs_today;
-        (0..=7u64).find_map(|d| {
-            let wd = ((c.weekday as u64 + d) % 7) as u8;
-            self.slots_on(midnight + d * 86_400, wd).into_iter().find(|s| *s > c.now)
-        })
+        (0..=8i64).find_map(|d| self.slots_on(c.day + d, c).into_iter().find(|s| *s > c.now))
     }
 
     /// Should a backup run now, given when the last one finished?
@@ -147,16 +169,45 @@ impl Schedule {
 mod tests {
     use super::*;
 
-    // Monday 2026-11-23 00:00 local, as if local == UTC for the test.
-    const MON_MIDNIGHT: u64 = 1_795_392_000;
+    // Monday 2026-11-23, as if local time == UTC.
+    const MON: i64 = 20_780;
 
-    fn clock(day: u64, h: u64, m: u64) -> Clock {
-        let secs_today = h * 3600 + m * 60;
-        Clock { now: MON_MIDNIGHT + day * 86_400 + secs_today, secs_today, weekday: (day % 7) as u8 }
+    fn utc(day: i64, min: u16) -> u64 {
+        (day * 86_400 + min as i64 * 60) as u64
     }
 
-    fn at(day: u64, h: u64, m: u64) -> u64 {
-        MON_MIDNIGHT + day * 86_400 + h * 3600 + m * 60
+    fn clock(day: i64, h: u16, m: u16) -> Clock {
+        Clock { now: utc(MON + day, h * 60 + m), day: MON + day, to_unix: utc }
+    }
+
+    fn at(day: i64, h: u16, m: u16) -> u64 {
+        utc(MON + day, h * 60 + m)
+    }
+
+    #[test]
+    fn calendar_helpers() {
+        assert_eq!(days_from_civil(2026, 11, 23), MON);
+        assert_eq!(civil_from_days(MON), (2026, 11, 23));
+        assert_eq!(weekday_of(MON), 0);
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
+        assert_eq!(weekday_of(days_from_civil(2026, 11, 29)), 6); // Sunday
+    }
+
+    // A zone that moves clocks back one hour starting on Wednesday (like the end of DST).
+    fn dst(day: i64, min: u16) -> u64 {
+        let base = (day * 86_400 + min as i64 * 60) as u64;
+        if day >= MON + 2 { base + 3600 } else { base }
+    }
+
+    #[test]
+    fn daylight_saving_change_keeps_wall_clock_time() {
+        let s = Schedule::Daily { times: vec![9 * 60], days: (0..7).collect() };
+        // Tuesday 10:00, backed up at Tuesday 09:00: next is Wednesday 09:00 *local*,
+        // which is 25 hours later in absolute time, not 24.
+        let c = Clock { now: dst(MON + 1, 600), day: MON + 1, to_unix: dst };
+        let next = s.next_run(Some(dst(MON + 1, 540)), &c).unwrap();
+        assert_eq!(next, dst(MON + 2, 540));
+        assert_eq!(next - dst(MON + 1, 540), 25 * 3600);
     }
 
     #[test]
