@@ -1,0 +1,187 @@
+//! User settings: what to back up, and which drives are allowed to receive backups.
+//!
+//! Stored at %APPDATA%\SyncApp\config.json (override the folder with SYNCAPP_HOME).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::engine::atomic_write;
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Source {
+    /// Folder name used on the drive, e.g. "Documents" -> X:\SyncApp Backup\Documents\...
+    pub name: String,
+    /// Folder or single file on this PC.
+    pub path: PathBuf,
+    /// Wildcard patterns (* and ?) matched against file names and relative paths.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DriveReg {
+    /// Random 128-bit id, also written to X:\.syncapp\drive.json.
+    pub drive_id: String,
+    pub name: String,
+    /// Volume serial at registration. A drive with the marker file but a
+    /// different serial (e.g. a copied marker) is refused.
+    pub volume_serial: Option<u32>,
+    /// Back up automatically when plugged in.
+    #[serde(default = "yes")]
+    pub auto_backup: bool,
+    /// Which sources go to this drive. None = all enabled sources.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    /// While plugged in, re-run every N minutes (0 = only on plug-in).
+    #[serde(default)]
+    pub repeat_minutes: u32,
+    #[serde(default)]
+    pub registered_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Config {
+    #[serde(default)]
+    pub sources: Vec<Source>,
+    #[serde(default)]
+    pub drives: Vec<DriveReg>,
+    #[serde(default = "yes")]
+    pub notifications: bool,
+    /// Pause automatic backups (manual ones still work).
+    #[serde(default)]
+    pub paused: bool,
+}
+
+pub fn config_dir() -> PathBuf {
+    if let Some(h) = std::env::var_os("SYNCAPP_HOME") {
+        return PathBuf::from(h);
+    }
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
+    base.join("SyncApp")
+}
+
+pub fn data_dir() -> PathBuf {
+    if let Some(h) = std::env::var_os("SYNCAPP_HOME") {
+        return PathBuf::from(h);
+    }
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
+    base.join("SyncApp")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+impl Config {
+    /// Missing file -> empty config. Corrupt file -> error (we never overwrite
+    /// a config we couldn't read, so a typo can't wipe your settings).
+    pub fn load() -> Result<Config, String> {
+        Self::load_from(&config_path())
+    }
+
+    pub fn load_from(path: &Path) -> Result<Config, String> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Settings file {} is invalid: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config { notifications: true, ..Default::default() }),
+            Err(e) => Err(format!("Cannot read {}: {e}", path.display())),
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        atomic_write(&config_path(), &json).map_err(|e| format!("Cannot save settings: {e}"))
+    }
+
+    pub fn drive(&self, id: &str) -> Option<&DriveReg> {
+        self.drives.iter().find(|d| d.drive_id == id)
+    }
+
+    pub fn drive_mut(&mut self, id: &str) -> Option<&mut DriveReg> {
+        self.drives.iter_mut().find(|d| d.drive_id == id)
+    }
+
+    /// Enabled sources selected for this drive.
+    pub fn sources_for(&self, d: &DriveReg) -> Vec<Source> {
+        self.sources
+            .iter()
+            .filter(|s| s.enabled)
+            .filter(|s| d.sources.as_ref().is_none_or(|sel| sel.iter().any(|n| n.eq_ignore_ascii_case(&s.name))))
+            .cloned()
+            .collect()
+    }
+
+    /// Add a source, deriving a unique name from the path when none is given.
+    pub fn add_source(&mut self, path: &Path, name: Option<&str>, exclude: Vec<String>) -> Result<Source, String> {
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+        if !path.exists() {
+            return Err(format!("{} does not exist", path.display()));
+        }
+        if self.sources.iter().any(|s| s.path == path) {
+            return Err(format!("{} is already a source", path.display()));
+        }
+        let name = match name {
+            Some(n) => n.trim().to_string(),
+            None => {
+                let base = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Drive".into());
+                let base = sanitize_name(&base);
+                let mut n = base.clone();
+                let mut i = 2;
+                while self.sources.iter().any(|s| s.name.eq_ignore_ascii_case(&n)) {
+                    n = format!("{base} ({i})");
+                    i += 1;
+                }
+                n
+            }
+        };
+        validate_name(&name)?;
+        if self.sources.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+            return Err(format!("A source named '{name}' already exists"));
+        }
+        let src = Source { name, path, exclude, enabled: true };
+        self.sources.push(src.clone());
+        Ok(src)
+    }
+}
+
+fn sanitize_name(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').to_string();
+    if cleaned.is_empty() { "Source".into() } else { cleaned }
+}
+
+/// Source names become folder names on the drive, so they must be safe ones.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 100 {
+        return Err("Name must be 1-100 characters".into());
+    }
+    if name.chars().any(|c| r#"\/:*?"<>|"#.contains(c) || c.is_control()) {
+        return Err(r#"Name cannot contain \ / : * ? " < > |"#.into());
+    }
+    if name == "." || name == ".." || name.ends_with('.') || name.ends_with(' ') || name.starts_with(' ') {
+        return Err("Name cannot start/end with a space or end with a dot".into());
+    }
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(format!("'{name}' is a reserved Windows name"));
+    }
+    Ok(())
+}
