@@ -84,6 +84,7 @@ pub fn register_drive(cfg: &mut Config, root: &str, name: Option<&str>) -> Resul
                 volume_serial: Some(vi.serial),
                 auto_backup: true,
                 sources: None,
+                schedule: Default::default(),
                 repeat_minutes: 0,
                 registered_at: win::now_unix(),
             };

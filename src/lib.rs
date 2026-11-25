@@ -4,6 +4,7 @@
 pub mod log;
 pub mod config;
 pub mod engine;
+pub mod schedule;
 pub mod service;
 pub mod win;
 

@@ -19,6 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use syncapp::config::{Config, DriveReg};
 use syncapp::engine::{human_bytes, Event};
+use syncapp::schedule::{self, Clock};
 use syncapp::service::{self, Identity};
 use syncapp::win::{self, wide, NamedLock};
 use syncapp::{info, warn};
@@ -362,19 +363,27 @@ fn check_drives() {
         }
     }
 
-    if repeat_check && !cfg.paused && cfg.drives.iter().any(|d| d.repeat_minutes > 0 && d.auto_backup) {
+    // Scheduled backups while a drive stays plugged in. Checked once a minute;
+    // only touches drives when one actually has a schedule.
+    if repeat_check && !cfg.paused && cfg.drives.iter().any(|d| d.auto_backup && !d.schedule.is_off()) {
+        let clock = Clock::now();
         for (root, reg) in service::connected_drives(&cfg) {
-            if reg.repeat_minutes == 0 || !reg.auto_backup {
+            if !reg.auto_backup || reg.schedule.is_off() {
                 continue;
             }
-            let due = {
-                let st = state();
-                st.last_run
-                    .iter()
-                    .find(|(id, _)| *id == reg.drive_id)
-                    .is_none_or(|(_, t)| t.elapsed() >= Duration::from_secs(reg.repeat_minutes as u64 * 60))
-            };
-            if due {
+            // Based on the last backup of any kind (plug-in, manual or scheduled), so a
+            // backup you just ran isn't immediately repeated.
+            let last = service::last_backup(&reg.drive_id).map(|h| h.finished_at);
+            if !reg.schedule.is_due(last, &clock) {
+                continue;
+            }
+            // If an attempt couldn't run (e.g. no sources selected), don't retry every minute.
+            let recently_tried = state()
+                .last_run
+                .iter()
+                .any(|(id, t)| *id == reg.drive_id && t.elapsed() < Duration::from_secs(schedule::RETRY_AFTER_S));
+            if !recently_tried {
+                info!("Scheduled backup to '{}' ({})", reg.name, reg.schedule.describe());
                 start_backup(cfg.clone(), root, reg);
             }
         }

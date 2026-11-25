@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::atomic_write;
+use crate::schedule::Schedule;
 
 fn yes() -> bool {
     true
@@ -40,8 +41,11 @@ pub struct DriveReg {
     /// Which sources go to this drive. None = all enabled sources.
     #[serde(default)]
     pub sources: Option<Vec<String>>,
-    /// While plugged in, re-run every N minutes (0 = only on plug-in).
+    /// Extra backups while the drive stays plugged in.
     #[serde(default)]
+    pub schedule: Schedule,
+    /// Old setting (pre-schedule); migrated into `schedule` on load.
+    #[serde(default, skip_serializing)]
     pub repeat_minutes: u32,
     #[serde(default)]
     pub registered_at: u64,
@@ -89,8 +93,17 @@ impl Config {
 
     pub fn load_from(path: &Path) -> Result<Config, String> {
         match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| format!("Settings file {} is invalid: {e}", path.display())),
+            Ok(bytes) => {
+                let mut cfg: Config = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("Settings file {} is invalid: {e}", path.display()))?;
+                for d in cfg.drives.iter_mut() {
+                    if d.schedule.is_off() && d.repeat_minutes > 0 {
+                        d.schedule = Schedule::Every { minutes: d.repeat_minutes };
+                    }
+                    d.repeat_minutes = 0;
+                }
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config { notifications: true, ..Default::default() }),
             Err(e) => Err(format!("Cannot read {}: {e}", path.display())),
         }

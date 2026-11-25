@@ -12,6 +12,7 @@ use egui_extras::{Column, TableBuilder};
 
 use syncapp::config::{config_path, Config, DriveReg};
 use syncapp::engine::{self, human_bytes, Event, Manifest, VerifyReport, VerifyStatus};
+use syncapp::schedule::{self, Clock, Schedule};
 use syncapp::service::{self, HistoryRecord, Identity};
 use syncapp::win::{self, VolumeInfo};
 
@@ -412,6 +413,9 @@ struct App {
     // verification report page
     verify_view: Option<VerifyView>,
     dev_verify: bool,
+    // schedule editor
+    interval_hours: HashMap<String, bool>,
+    new_time: (u32, u32),
 }
 
 fn file_mtime(p: &Path) -> Option<SystemTime> {
@@ -426,6 +430,19 @@ fn when(unix: u64) -> String {
         60..=3599 => format!("{} min ago", ago / 60),
         3600..=86_399 => format!("{} h ago", ago / 3600),
         _ => format!("{} days ago", ago / 86_400),
+    };
+    format!("{} ({rel})", win::local_time_string(unix))
+}
+
+/// Future time as "YYYY-MM-DD HH:MM:SS (in 3 h)".
+fn until(unix: u64) -> String {
+    let now = win::now_unix();
+    let d = unix.saturating_sub(now);
+    let rel = match d {
+        0..=59 => "now".to_string(),
+        60..=3599 => format!("in {} min", d / 60),
+        3600..=86_399 => format!("in {} h {} min", d / 3600, d % 3600 / 60),
+        _ => format!("in {} days", d / 86_400),
     };
     format!("{} ({rel})", win::local_time_string(unix))
 }
@@ -506,6 +523,8 @@ impl App {
             browser: None,
             verify_view: None,
             dev_verify: false,
+            interval_hours: HashMap::new(),
+            new_time: (12, 0),
         };
         app.refresh();
         // Developer aid (screenshots/docs): open on a given page.
@@ -1175,6 +1194,8 @@ impl App {
                                 None => "Never backed up".into(),
                             };
                             ui.label(RichText::new(line).small().weak());
+                            let plan = if !reg.auto_backup { "Manual backups only".to_string() } else { reg.schedule.describe() };
+                            ui.label(RichText::new(plan).small().weak());
                         })
                         .response
                         .interact(Sense::click());
@@ -1345,19 +1366,146 @@ impl App {
         // Automatic backup
         ui.add_space(14.0);
         ui.heading("Automatic backup");
+        let last_backup = self.history.iter().rev().find(|h| h.drive_id == id && h.kind == "backup").map(|h| h.finished_at);
+        let unit_hours = self.interval_hours.entry(id.to_string()).or_insert_with(|| {
+            matches!(reg.schedule, Schedule::Every { minutes } if minutes >= 60 && minutes % 60 == 0)
+        });
+        let new_time = &mut self.new_time;
+        let paused = self.cfg.paused;
         let d = self.cfg.drive_mut(id).unwrap();
         changed |= ui.checkbox(&mut d.auto_backup, "Back up automatically when this drive is plugged in").changed();
         ui.add_enabled_ui(d.auto_backup, |ui| {
-            ui.horizontal(|ui| {
-                let mut repeat = d.repeat_minutes > 0;
-                if ui.checkbox(&mut repeat, "While plugged in, also back up every").changed() {
-                    d.repeat_minutes = if repeat { 60 } else { 0 };
+            ui.add_space(4.0);
+            ui.label("While it stays plugged in:");
+            let mode = match d.schedule {
+                Schedule::Off => 0,
+                Schedule::Every { .. } => 1,
+                Schedule::Daily { .. } => 2,
+            };
+            ui.indent("sched", |ui| {
+                if ui.radio(mode == 0, "Don't back up again until it's plugged in next time").clicked() && mode != 0 {
+                    d.schedule = Schedule::Off;
                     changed = true;
                 }
-                ui.add_enabled_ui(repeat, |ui| {
-                    changed |= ui.add(egui::DragValue::new(&mut d.repeat_minutes).range(5..=1440).suffix(" min")).changed();
-                });
+                if ui.radio(mode == 1, "Back up at regular intervals").clicked() && mode != 1 {
+                    d.schedule = Schedule::Every { minutes: 120 };
+                    *unit_hours = true;
+                    changed = true;
+                }
+                if let Schedule::Every { minutes } = &mut d.schedule {
+                    ui.indent("every", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Every");
+                            let mut amount = if *unit_hours { (*minutes / 60).max(1) } else { *minutes };
+                            let range = if *unit_hours { 1..=24 } else { schedule::MIN_INTERVAL..=1440 };
+                            let r1 = ui.add(egui::DragValue::new(&mut amount).range(range)).changed();
+                            let mut hours = *unit_hours;
+                            egui::ComboBox::from_id_salt("interval_unit")
+                                .width(80.0)
+                                .selected_text(if hours { "hours" } else { "minutes" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut hours, false, "minutes");
+                                    ui.selectable_value(&mut hours, true, "hours");
+                                });
+                            if hours != *unit_hours {
+                                *unit_hours = hours;
+                                amount = if hours { (*minutes).div_ceil(60).clamp(1, 24) } else { *minutes };
+                            }
+                            let new = if *unit_hours { amount.clamp(1, 24) * 60 } else { amount.max(schedule::MIN_INTERVAL) };
+                            if r1 || new != *minutes {
+                                changed |= new != *minutes;
+                                *minutes = new;
+                            }
+                        });
+                    });
+                }
+                if ui.radio(mode == 2, "Back up at set times of day").clicked() && mode != 2 {
+                    d.schedule = Schedule::times_per_day(3);
+                    changed = true;
+                }
+                if let Schedule::Daily { times, days } = &mut d.schedule {
+                    ui.indent("daily", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Quick set:");
+                            for (n, label) in [(1, "Once a day"), (2, "2x a day"), (3, "3x a day"), (4, "4x a day")] {
+                                if ui.small_button(label).clicked() {
+                                    if let Schedule::Daily { times: t, .. } = Schedule::times_per_day(n) {
+                                        *times = t;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Times:");
+                            times.sort();
+                            let mut remove = None;
+                            let can_remove = times.len() > 1;
+                            for (i, t) in times.iter().enumerate() {
+                                let b = ui.add_enabled(can_remove, egui::Button::new(format!("{}  x", schedule::fmt_time(*t))).small());
+                                if b.on_hover_text("Remove this time").clicked() {
+                                    remove = Some(i);
+                                }
+                            }
+                            if let Some(i) = remove {
+                                times.remove(i);
+                                changed = true;
+                            }
+                            ui.add_space(12.0);
+                            ui.add(egui::DragValue::new(&mut new_time.0).range(0..=23).custom_formatter(|n, _| format!("{:02}", n as i64)));
+                            ui.label(":");
+                            ui.add(egui::DragValue::new(&mut new_time.1).range(0..=59).custom_formatter(|n, _| format!("{:02}", n as i64)));
+                            let t = (new_time.0 * 60 + new_time.1) as u16;
+                            if ui.add_enabled(!times.contains(&t) && times.len() < 24, egui::Button::new("Add time").small()).clicked() {
+                                times.push(t);
+                                times.sort();
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Days:");
+                            for (i, name) in schedule::DAY_NAMES.iter().enumerate() {
+                                let on = days.contains(&(i as u8));
+                                if ui.selectable_label(on, *name).clicked() {
+                                    if on {
+                                        days.retain(|x| *x != i as u8);
+                                    } else {
+                                        days.push(i as u8);
+                                        days.sort();
+                                    }
+                                    changed = true;
+                                }
+                            }
+                            ui.add_space(8.0);
+                            if ui.small_button("Every day").clicked() {
+                                *days = (0..7).collect();
+                                changed = true;
+                            }
+                            if ui.small_button("Weekdays").clicked() {
+                                *days = (0..5).collect();
+                                changed = true;
+                            }
+                        });
+                        if days.is_empty() {
+                            ui.colored_label(WARN, "Pick at least one day, or no scheduled backups will happen.");
+                        }
+                    });
+                }
             });
+            ui.add_space(4.0);
+            match d.schedule.next_run(last_backup, &Clock::now()) {
+                Some(next) if d.auto_backup && !paused => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{}.", d.schedule.describe())).weak());
+                        ui.label(RichText::new(format!("Next scheduled backup: {}", until(next))).strong());
+                    });
+                    ui.label(RichText::new("Scheduled backups only run while the drive is plugged in; a missed time is caught up as soon as it's plugged in again (plugging in always backs up anyway).").weak().small());
+                }
+                _ if paused && !d.schedule.is_off() => {
+                    ui.colored_label(WARN, "Automatic backups are paused (Settings), so scheduled backups won't run.");
+                }
+                _ => {}
+            }
         });
 
         // What goes to this drive

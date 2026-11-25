@@ -162,6 +162,17 @@ pub fn local_now_string() -> String {
     fmt_systemtime(&t)
 }
 
+/// Current local wall-clock time for schedules.
+pub fn local_clock() -> crate::schedule::Clock {
+    let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut t) };
+    crate::schedule::Clock {
+        now: now_unix(),
+        secs_today: t.wHour as u64 * 3600 + t.wMinute as u64 * 60 + t.wSecond as u64,
+        weekday: ((t.wDayOfWeek + 6) % 7) as u8, // Windows: 0 = Sunday
+    }
+}
+
 /// Unix seconds -> "YYYY-MM-DD HH:MM:SS" in local time.
 pub fn local_time_string(unix: u64) -> String {
     let ticks = (unix + 11_644_473_600) * 10_000_000;
