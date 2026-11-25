@@ -27,6 +27,7 @@ const MANAGER_LOCK: &str = "Local\\SyncApp-Manager";
 fn main() {
     win::suppress_error_dialogs();
     syncapp::config::Config::ensure_pc_id();
+    syncapp::update::cleanup_after_update();
     if std::env::args().nth(1).as_deref() == Some("--tray") {
         tray::run();
         return;
@@ -170,6 +171,29 @@ pub fn uninstall(remove_data: bool) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(syncapp::config::data_dir());
     }
     Ok("SyncApp has been uninstalled. Your backups on your drives are untouched.".into())
+}
+
+/// Replace the running SyncApp.exe with a downloaded, verified update and start it.
+/// The background service is stopped first (it refuses while a backup is running).
+/// The previous exe is kept as SyncApp.exe.old until the new version has started.
+pub fn install_update(new_exe: &std::path::Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let old = syncapp::update::old_exe_path(&exe);
+    stop_tray()?;
+    let _ = std::fs::remove_file(&old);
+    // A running exe can't be overwritten, but it can be renamed out of the way.
+    std::fs::rename(&exe, &old).map_err(|e| format!("couldn't replace {}: {e}", exe.display()))?;
+    if let Err(e) = std::fs::copy(new_exe, &exe) {
+        let _ = std::fs::rename(&old, &exe); // put the current version back
+        return Err(format!("couldn't install the update: {e}"));
+    }
+    syncapp::info!("Installing update from {}", new_exe.display());
+    Command::new(&exe).spawn().map_err(|e| {
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::rename(&old, &exe);
+        format!("couldn't start the new version: {e}")
+    })?;
+    Ok(())
 }
 
 trait NoWindow {

@@ -52,6 +52,7 @@ enum JobKind {
     Verify,
     Restore,
     Cleanup,
+    Update,
 }
 
 struct JobResult {
@@ -415,6 +416,7 @@ impl Cleanup {
 }
 
 enum Confirm {
+    InstallUpdate(PathBuf, String),
     Cleanup(Vec<String>, u64),
     Uninstall,
     Unregister { id: String, name: String },
@@ -485,9 +487,16 @@ struct App {
     browser: Option<Browser>,
     // clean-up tab
     cleanup: Option<Cleanup>,
+    // updates
+    update_state: syncapp::update::UpdateState,
+    update_check: Option<Arc<Mutex<Option<Result<Option<syncapp::update::Release>, String>>>>>,
+    update_ready: Arc<Mutex<Option<PathBuf>>>,
+    update_banner_hidden: bool,
+    update_status: Option<(String, bool)>,
     // verification report page
     verify_view: Option<VerifyView>,
     dev_verify: bool,
+    dev_check_update: bool,
     // schedule editor
     interval_hours: HashMap<String, bool>,
     new_time: (u32, u32),
@@ -606,8 +615,14 @@ impl App {
             sizes_sig: String::new(),
             browser: None,
             cleanup: None,
+            update_state: syncapp::update::load_state(),
+            update_check: None,
+            update_ready: Default::default(),
+            update_banner_hidden: false,
+            update_status: None,
             verify_view: None,
             dev_verify: false,
+            dev_check_update: false,
             interval_hours: HashMap::new(),
             new_time: (12, 0),
         };
@@ -621,6 +636,10 @@ impl App {
             Ok("history") => app.tab = Tab::History,
             Ok("settings") => app.tab = Tab::Settings,
             Ok("verify") => app.dev_verify = true,
+            Ok("updates") => {
+                app.tab = Tab::Settings;
+                app.dev_check_update = true;
+            }
             _ => {}
         }
         app
@@ -839,6 +858,13 @@ impl App {
         let kind = job.kind;
         let verify = res.verify.take();
         drop(p);
+        if kind == JobKind::Update {
+            if let Some(path) = self.update_ready.lock().unwrap().take() {
+                let v = self.update_state.newer().map(|r| r.version.clone()).unwrap_or_default();
+                self.confirm = Some(Confirm::InstallUpdate(path, v));
+            }
+            return;
+        }
         self.drive_stats.lock().unwrap().clear();
         self.drive_stats_pending.clear();
         self.reload_history_if_changed();
@@ -926,6 +952,9 @@ impl App {
             ctx.request_repaint_after(Duration::from_secs(2));
         }
         self.handle_finished_job(&ctx);
+        if std::mem::take(&mut self.dev_check_update) {
+            self.check_for_update(&ctx);
+        }
         if std::mem::take(&mut self.dev_verify) {
             if let Some((c, r)) = self.connected.first() {
                 let (root, reg) = (c.root.clone(), r.clone());
@@ -992,6 +1021,8 @@ impl App {
                 });
                 ui.separator();
             }
+            self.poll_update_check();
+            self.ui_update_banner(ui);
             self.ui_job(ui);
             if self.verify_view.is_some() {
                 self.ui_verify_report(ui);
@@ -2197,6 +2228,87 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------ updates
+
+    fn check_for_update(&mut self, ctx: &egui::Context) {
+        if self.update_check.is_some() {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let (s2, ctx) = (slot.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            *s2.lock().unwrap() = Some(syncapp::update::check());
+            ctx.request_repaint();
+        });
+        self.update_check = Some(slot);
+        self.update_status = Some(("Checking GitHub for updates...".into(), false));
+    }
+
+    fn poll_update_check(&mut self) {
+        let done = self.update_check.as_ref().and_then(|s| s.lock().unwrap().take());
+        if let Some(res) = done {
+            self.update_check = None;
+            self.update_state = syncapp::update::load_state();
+            self.update_banner_hidden = false;
+            self.update_status = Some(match res {
+                Ok(Some(r)) => (format!("SyncApp {} is available.", r.version), false),
+                Ok(None) => (format!("You have the latest version ({}).", syncapp::update::CURRENT), false),
+                Err(e) => (format!("Couldn't check for updates: {e}"), true),
+            });
+        }
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let Some(rel) = self.update_state.newer().cloned() else { return };
+        let ready = self.update_ready.clone();
+        self.start_job(ctx, JobKind::Update, format!("Downloading SyncApp {}", rel.version), move |cancel, cb| {
+            cb(Event::Planned { files: 1, bytes: rel.size });
+            cb(Event::File { index: 1, total: 1, key: "SyncApp.exe" });
+            let mut progress = |done: u64, total: u64| cb(Event::Bytes { done, total: total.max(rel.size) });
+            match syncapp::update::download(&rel, cancel, &mut progress) {
+                Ok(path) => {
+                    *ready.lock().unwrap() = Some(path);
+                    JobResult {
+                        ok: true,
+                        msg: format!("SyncApp {} downloaded and verified.", rel.version),
+                        errors: vec![],
+                        verify: None,
+                    }
+                }
+                Err(e) => JobResult { ok: false, msg: format!("Update failed: {e}"), errors: vec![], verify: None },
+            }
+        });
+    }
+
+    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
+        if self.update_banner_hidden || self.job.as_ref().is_some_and(|j| j.kind == JobKind::Update) {
+            return;
+        }
+        let Some(rel) = self.update_state.newer().cloned() else { return };
+        let ctx = ui.ctx().clone();
+        let busy = self.job_running();
+        egui::Frame::group(ui.style()).fill(ui.visuals().selection.bg_fill.gamma_multiply(0.25)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                dot(ui, OK);
+                ui.label(RichText::new(format!("SyncApp {} is available", rel.version)).strong());
+                ui.label(RichText::new(format!("(you have {})", syncapp::update::CURRENT)).weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Later").clicked() {
+                        self.update_banner_hidden = true;
+                    }
+                    if ui.small_button("What's new").clicked() {
+                        win::shell_open(Path::new(&rel.page_url));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Update now").strong())).clicked() {
+                        self.start_update(&ctx);
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
+    }
+
     // ------------------------------------------------------------------ clean-up
 
     fn start_cleanup(&mut self, ctx: &egui::Context, keys: Vec<String>) {
@@ -2630,6 +2742,47 @@ impl App {
         }
 
         ui.add_space(14.0);
+        ui.heading("Updates");
+        let ctx = ui.ctx().clone();
+        ui.label(format!("Version {}", syncapp::update::CURRENT));
+        if ui
+            .checkbox(&mut self.cfg.check_updates, "Check GitHub for updates once a day and notify me")
+            .on_hover_text("Only asks GitHub for the latest release; nothing is installed without your click.")
+            .changed()
+        {
+            self.save();
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.update_check.is_none(), egui::Button::new("Check now")).clicked() {
+                self.check_for_update(&ctx);
+            }
+            if let Some(rel) = self.update_state.newer().cloned() {
+                if ui.add_enabled(!self.job_running(), egui::Button::new(RichText::new(format!("Update to {}", rel.version)).strong())).clicked() {
+                    self.start_update(&ctx);
+                }
+                if ui.button("What's new").clicked() {
+                    win::shell_open(Path::new(&rel.page_url));
+                }
+            }
+            if ui.button("All releases").clicked() {
+                win::shell_open(Path::new(&syncapp::update::releases_page()));
+            }
+        });
+        if let Some((m, bad)) = &self.update_status {
+            ui.colored_label(if *bad { WARN } else { ui.visuals().text_color() }, m);
+        } else if self.update_state.checked_at > 0 {
+            ui.label(RichText::new(format!("Last checked {}", when(self.update_state.checked_at))).weak().small());
+        }
+        if let Some(rel) = self.update_state.newer() {
+            if !rel.notes.trim().is_empty() {
+                egui::CollapsingHeader::new("Release notes").show(ui, |ui| {
+                    ui.label(rel.notes.trim());
+                });
+            }
+        }
+        ui.label(RichText::new("Updates come only from this project's GitHub releases and must match the published SHA-256 checksum.").weak().small());
+
+        ui.add_space(14.0);
         ui.heading("Install");
         let exe = std::env::current_exe().unwrap_or_default();
         let target = crate::install_dir().join(crate::EXE_NAME);
@@ -2674,7 +2827,7 @@ impl App {
         for line in [
             "- Only drives you mark are used. A copied ID file isn't enough: the volume serial must match too.",
             "- Files on your PC are only read, never changed, during a backup.",
-            "- Nothing on the backup drive is deleted. Files you delete on the PC stay in the backup.",
+            "- Nothing on the backup drive is deleted unless you choose to in Clean up. Files you delete on the PC stay in the backup until then.",
             "- Every copy is written to a temp file, flushed to the drive, read back directly from the drive, checksum-verified, and only then swapped in. Unplugging mid-backup can't damage an existing backup.",
             "- If nothing changed, nothing is written to the drive.",
             "- For encryption, turn on BitLocker To Go for the drive (right-click it in Explorer > Turn on BitLocker). SyncApp works unchanged on encrypted drives.",
@@ -2688,6 +2841,10 @@ impl App {
     fn ui_confirm(&mut self, ctx: &egui::Context) {
         let Some(c) = &self.confirm else { return };
         let (title, body) = match c {
+            Confirm::InstallUpdate(_, v) => (
+                format!("Restart to finish updating to SyncApp {v}?"),
+                "SyncApp closes, the background service restarts, and the new version opens. This takes a few seconds. Your settings and backups are not affected.".to_string(),
+            ),
             Confirm::Cleanup(keys, bytes) => (
                 format!("Permanently delete {} from the backup drive?", files_word(keys.len() as u64)),
                 format!(
@@ -2763,6 +2920,13 @@ impl App {
             }
             Confirm::RestoreOverwrite(files, desc) => self.restore_files(ctx, files, desc),
             Confirm::Cleanup(keys, _) => self.start_cleanup(ctx, keys),
+            Confirm::InstallUpdate(path, _) => {
+                self.flush_save();
+                match crate::install_update(&path) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.message = Some((format!("Update not installed: {e}"), true)),
+                }
+            }
             Confirm::Uninstall => {
                 self.flush_save();
                 match crate::uninstall(self.uninstall_remove_data) {

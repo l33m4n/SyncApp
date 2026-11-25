@@ -95,6 +95,9 @@ pub struct Config {
     /// (backups when a drive is plugged in still happen).
     #[serde(default = "yes")]
     pub skip_on_battery_saver: bool,
+    /// Check GitHub for a newer version once a day and notify.
+    #[serde(default = "yes")]
+    pub check_updates: bool,
 }
 
 impl Config {

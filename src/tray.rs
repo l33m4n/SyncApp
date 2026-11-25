@@ -57,6 +57,11 @@ const WM_BACKUP_DONE: u32 = WM_APP + 3;
 const TIMER_SAFETY: usize = 1;
 const TIMER_ARRIVAL: usize = 2;
 const TIMER_SCHEDULE: usize = 3;
+const TIMER_UPDATE: usize = 4;
+/// First update check a couple of minutes after start, then re-evaluated every 6 hours
+/// (a real check only happens when the last one is 24 hours old).
+const UPDATE_FIRST_MS: u32 = 2 * 60 * 1000;
+const UPDATE_EVERY_MS: u32 = 6 * 3600 * 1000;
 const SAFETY_POLL_MS: u32 = 60_000;
 /// Re-check the schedule at least this often, in case the clock jumps or the PC slept.
 const MAX_SCHEDULE_WAIT_S: u64 = 30 * 60;
@@ -227,6 +232,7 @@ pub fn run() {
         // known_mask starts at 0, so drives already plugged in at sign-in count as arrivals.
         SetTimer(h, TIMER_ARRIVAL, 3000, None);
         SetTimer(h, TIMER_SAFETY, SAFETY_POLL_MS, None);
+        SetTimer(h, TIMER_UPDATE, UPDATE_FIRST_MS, None);
         win::trim_memory();
 
         let mut msg: MSG = std::mem::zeroed();
@@ -252,6 +258,10 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     TIMER_SCHEDULE => {
                         KillTimer(h, TIMER_SCHEDULE);
                         run_due_schedules();
+                    }
+                    TIMER_UPDATE => {
+                        SetTimer(h, TIMER_UPDATE, UPDATE_EVERY_MS, None);
+                        maybe_check_for_update();
                     }
                     _ => {
                         // Safety net, once a minute: catches anything the events missed.
@@ -312,6 +322,8 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_TRAY => {
                 match lp as u32 {
                     WM_LBUTTONDBLCLK => open_manager(),
+                    // Clicking a notification (e.g. "update available") opens the window.
+                    windows_sys::Win32::UI::Shell::NIN_BALLOONUSERCLICK => open_manager(),
                     WM_RBUTTONUP => show_menu(h),
                     _ => {}
                 }
@@ -510,6 +522,41 @@ fn rescan_backup_drives() {
     let mut st = state();
     st.backup_drives = found;
     st.known_mask = win::drive_mask();
+}
+
+// ------------------------------------------------------------------ updates
+
+/// Check GitHub for a new version if automatic checks are on and the last check is a
+/// day old; notify once per new version. Runs on a worker thread (network).
+fn maybe_check_for_update() {
+    reload_config(false);
+    if !state().cfg.check_updates {
+        return;
+    }
+    let st = syncapp::update::load_state();
+    if win::now_unix().saturating_sub(st.checked_at) < syncapp::update::CHECK_EVERY_S {
+        return;
+    }
+    std::thread::spawn(|| {
+        win::thread_background_mode();
+        match syncapp::update::check() {
+            Ok(Some(rel)) => {
+                let mut st = syncapp::update::load_state();
+                if st.notified.as_deref() != Some(rel.version.as_str()) {
+                    notify(
+                        &format!("SyncApp {} is available", rel.version),
+                        "Click here to open SyncApp and update (it takes a few seconds).",
+                        false,
+                    );
+                    st.notified = Some(rel.version.clone());
+                    syncapp::update::save_state(&st);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => info!("Update check failed: {e}"),
+        }
+        win::trim_memory();
+    });
 }
 
 // ------------------------------------------------------------------ schedules

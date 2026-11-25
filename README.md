@@ -25,6 +25,7 @@ Other features:
 - **Verify integrity**: re-reads every file on the drive and checks it against the checksum recorded at backup time. Corrupted files are re-copied on the next backup.
 - **Restore**: browse the backup, search it, and restore selected files or folders to where they came from or to another folder. Each file shows whether it's missing or different on this PC, and which PC backed it up. Existing files are only replaced if you tick the option.
 - **Clean up**: lists backed-up files that no PC has any more (deleted, renamed or moved everywhere, or from folders you stopped backing up), with their total size. Review and delete them to free space; SyncApp never deletes them on its own.
+- **Updates**: once a day SyncApp asks GitHub whether a newer release exists and notifies you (can be turned off). **Update now** downloads it, checks it against the SHA-256 checksum published with the release, and restarts into the new version; it never updates while a backup is running and never installs anything without your click.
 - **Battery saver**: scheduled backups wait while Windows Battery saver is on (optional; plug-in backups still run).
 - **History**: every backup, verify, restore and clean-up, with any per-file problems.
 - **Pause**: from the tray menu or Settings.
@@ -58,7 +59,17 @@ cargo build --release      # -> target\release\SyncApp.exe
 cargo test                 # all tests
 ```
 
-Every push is built and tested on Windows by GitHub Actions (`.github/workflows/ci.yml`), which also uploads `SyncApp.exe`. Pushing a tag such as `v0.2.0` publishes a GitHub Release with the exe attached.
+Every push is built and tested on Windows by GitHub Actions (`.github/workflows/ci.yml`), which also keeps `SyncApp.exe` as a build artifact.
+
+### Releasing an update
+
+Just push to `main`. When the build and tests pass, the workflow:
+
+1. picks the next version automatically: the last published version + 1 (0.1.1, 0.1.2, ...), or the `version` in `Cargo.toml` if that is higher;
+2. builds `SyncApp.exe` with that version;
+3. replaces the single rolling GitHub release tagged `release` (titled "SyncApp X.Y.Z") with the new exe and its `SyncApp.exe.sha256` checksum.
+
+Installed copies of SyncApp see it at their next daily check (or right away with **Settings > Check now**). To start a new minor or major series, set `version` in `Cargo.toml` (e.g. `0.2.0`) and push.
 
 The exe is not code-signed, so Windows SmartScreen may warn the first time someone runs a downloaded copy.
 
