@@ -3,6 +3,7 @@ name = "syncapp"
 version = "0.1.0"
 edition = "2024"
 description = "Automatic, verified backups to marked external drives"
+license = "MIT"
 
 [[bin]]
 name = "SyncApp"

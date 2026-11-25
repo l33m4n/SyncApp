@@ -91,3 +91,7 @@ assets/        app icon (regenerate with scripts/make_icon.py)
 tests/         engine, multi-PC/clean-up and restore-path tests
 examples/      bench.rs performance check
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

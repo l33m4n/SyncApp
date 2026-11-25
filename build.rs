@@ -11,7 +11,8 @@ fn main() {
         .set("FileDescription", "SyncApp - automatic backups to your marked drives")
         .set("ProductName", "SyncApp")
         .set("OriginalFilename", "SyncApp.exe")
-        .set("InternalName", "SyncApp");
+        .set("InternalName", "SyncApp")
+        .set("LegalCopyright", "Copyright (c) 2026 banana. MIT License.");
     // Version fields come from Cargo.toml's `version` automatically.
     if let Err(e) = res.compile() {
         // Don't fail the build over cosmetics (e.g. no resource compiler available).
