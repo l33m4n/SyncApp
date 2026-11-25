@@ -24,15 +24,30 @@ pub const MANAGER_TITLE: &str = "SyncApp";
 pub const EXE_NAME: &str = "SyncApp.exe";
 const MANAGER_LOCK: &str = "Local\\SyncApp-Manager";
 
+/// Started by the updater to open the new version's window.
+const AFTER_UPDATE: &str = "--after-update";
+
 fn main() {
     win::suppress_error_dialogs();
+    let arg = std::env::args().nth(1);
+    // Just updated: either told so, or started by an older updater (the previous exe is
+    // still next to us). Checked before cleanup removes the old exe.
+    let just_updated = arg.as_deref() == Some(AFTER_UPDATE)
+        || std::env::current_exe().is_ok_and(|e| syncapp::update::old_exe_path(&e).exists());
     syncapp::config::Config::ensure_pc_id();
     syncapp::update::cleanup_after_update();
-    if std::env::args().nth(1).as_deref() == Some("--tray") {
+    if arg.as_deref() == Some("--tray") {
         tray::run();
         return;
     }
-    let Ok(Some(_lock)) = NamedLock::try_acquire(MANAGER_LOCK) else {
+    // After an update the previous version's window is still closing: wait for it rather
+    // than mistaking it for an already-open SyncApp.
+    let lock = if just_updated {
+        NamedLock::acquire_wait(MANAGER_LOCK, 20_000)
+    } else {
+        NamedLock::try_acquire(MANAGER_LOCK)
+    };
+    let Ok(Some(_lock)) = lock else {
         focus_existing_manager();
         return;
     };
@@ -188,11 +203,14 @@ pub fn install_update(new_exe: &std::path::Path) -> Result<(), String> {
         return Err(format!("couldn't install the update: {e}"));
     }
     syncapp::info!("Installing update from {}", new_exe.display());
-    Command::new(&exe).spawn().map_err(|e| {
+    // Background service first, so automatic backups resume even if the window can't open.
+    let started = Command::new(&exe).arg("--tray").spawn().and_then(|_| Command::new(&exe).arg(AFTER_UPDATE).spawn());
+    if let Err(e) = started {
         let _ = std::fs::remove_file(&exe);
         let _ = std::fs::rename(&old, &exe);
-        format!("couldn't start the new version: {e}")
-    })?;
+        spawn_tray(); // bring the previous version's service back
+        return Err(format!("couldn't start the new version: {e}"));
+    }
     Ok(())
 }
 
