@@ -2790,10 +2790,14 @@ impl App {
         if exe != target {
             ui.label("Install SyncApp to your user profile so it has a permanent home, a Start menu entry, and starts with Windows.");
             if ui.button(format!("Install to {}", target.parent().unwrap().display())).clicked() {
+                self.flush_save();
                 match crate::install() {
                     Ok(msg) => {
                         self.message = Some((msg, false));
                         self.autostart = true;
+                        self.save_due = None;
+                        // The installed copy opens its own window with the same settings.
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     Err(e) => self.message = Some((format!("Install failed: {e}"), true)),
                 }

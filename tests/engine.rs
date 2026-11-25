@@ -8,6 +8,16 @@ use std::time::{Duration, SystemTime};
 use syncapp::config::Source;
 use syncapp::engine::{self, wildcard, Manifest, BACKUP_DIR};
 
+/// Keep this test program's log/history out of the user's real SyncApp folders.
+fn isolate() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let d = std::env::temp_dir().join(format!("syncapp-tests-{}", std::process::id()));
+        // Safe: done once, before any test touches the environment (every test calls this first).
+        unsafe { std::env::set_var("SYNCAPP_HOME", d) };
+    });
+}
+
 struct Env {
     _tmp: tempfile::TempDir,
     pc: PathBuf,
@@ -15,6 +25,7 @@ struct Env {
 }
 
 fn env() -> Env {
+    isolate();
     let tmp = tempfile::tempdir().unwrap();
     let pc = tmp.path().join("pc");
     let drive = tmp.path().join("drive");

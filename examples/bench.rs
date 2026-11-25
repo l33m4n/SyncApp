@@ -24,6 +24,9 @@ fn main() {
         syncapp::win::thread_background_mode();
     }
     std::fs::create_dir_all(&target).unwrap();
+    // Log into the target folder, not the user's real SyncApp log.
+    // Safe: single-threaded at this point.
+    unsafe { std::env::set_var("SYNCAPP_HOME", target.join(".bench-log")) };
     let sources = vec![Source { name: "Data".into(), path: src, exclude: vec![], enabled: true, kind: None }];
     let pc = PcIdentity { id: "bench".into(), name: "BENCH".into() };
     let no = AtomicBool::new(false);

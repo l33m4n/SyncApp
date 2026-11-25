@@ -77,7 +77,7 @@ pub struct DriveReg {
     pub registered_at: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     #[serde(default)]
     pub sources: Vec<Source>,
@@ -100,7 +100,31 @@ pub struct Config {
     pub check_updates: bool,
 }
 
+impl Default for Config {
+    /// Same defaults as a settings file that doesn't mention an option.
+    fn default() -> Self {
+        Config {
+            sources: Vec::new(),
+            drives: Vec::new(),
+            notifications: true,
+            paused: false,
+            pc_id: String::new(),
+            skip_on_battery_saver: true,
+            check_updates: true,
+        }
+    }
+}
+
 impl Config {
+    /// `import_into_standard_folders` for the installer: logs and maps errors to text.
+    pub fn import_into_standard_folders_logged() -> Result<usize, String> {
+        let n = import_into_standard_folders().map_err(|e| format!("couldn't carry over settings: {e}"))?;
+        if n > 0 {
+            crate::info!("Carried {n} settings/history file(s) over to the standard folders");
+        }
+        Ok(n)
+    }
+
     /// This PC's identity for backups (name is the current Windows computer name).
     pub fn pc(&self) -> crate::engine::PcIdentity {
         crate::engine::PcIdentity {
@@ -122,20 +146,75 @@ impl Config {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    if let Some(h) = std::env::var_os("SYNCAPP_HOME") {
-        return PathBuf::from(h);
-    }
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
-    base.join("SyncApp")
+/// Standard settings folder: %APPDATA%\SyncApp.
+pub fn default_config_dir() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into()).join("SyncApp")
 }
 
+/// Standard folder for history, log and other data: %LOCALAPPDATA%\SyncApp.
+pub fn default_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into()).join("SyncApp")
+}
+
+/// Settings folder in use (SYNCAPP_HOME overrides the standard one).
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("SYNCAPP_HOME").map(PathBuf::from).unwrap_or_else(default_config_dir)
+}
+
+/// Data folder in use (SYNCAPP_HOME overrides the standard one).
 pub fn data_dir() -> PathBuf {
-    if let Some(h) = std::env::var_os("SYNCAPP_HOME") {
-        return PathBuf::from(h);
+    std::env::var_os("SYNCAPP_HOME").map(PathBuf::from).unwrap_or_else(default_data_dir)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+    norm(a).trim_end_matches('\\') == norm(b).trim_end_matches('\\')
+}
+
+/// Copy one file, keeping a different file already at `dst` as "<name>.before-install".
+fn import_file(src: &Path, dst: &Path) -> std::io::Result<bool> {
+    if !src.is_file() {
+        return Ok(false);
     }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
-    base.join("SyncApp")
+    if let Some(p) = dst.parent() {
+        fs::create_dir_all(p)?;
+    }
+    if dst.exists() {
+        if fs::read(src)? == fs::read(dst)? {
+            return Ok(false);
+        }
+        let mut backup = dst.as_os_str().to_owned();
+        backup.push(".before-install");
+        let backup = PathBuf::from(backup);
+        let _ = fs::remove_file(&backup);
+        fs::rename(dst, &backup)?;
+    }
+    fs::copy(src, dst)?;
+    Ok(true)
+}
+
+/// Bring this copy's settings, history, verification reports and log into the standard
+/// folders, so an installed SyncApp carries on exactly like the copy it was installed from.
+/// Does nothing when this copy already uses the standard folders. Returns files copied.
+pub fn import_into_standard_folders() -> std::io::Result<usize> {
+    let (src_cfg, src_data) = (config_dir(), data_dir());
+    let (dst_cfg, dst_data) = (default_config_dir(), default_data_dir());
+    let mut copied = 0;
+    if !same_dir(&src_cfg, &dst_cfg) {
+        copied += import_file(&src_cfg.join("config.json"), &dst_cfg.join("config.json"))? as usize;
+    }
+    if !same_dir(&src_data, &dst_data) && src_data.is_dir() {
+        for entry in fs::read_dir(&src_data)?.flatten() {
+            let name = entry.file_name();
+            let n = name.to_string_lossy().to_lowercase();
+            // Settings were handled above; skip downloads/temp files and backups.
+            if n == "config.json" || n.ends_with(".tmp") || n.ends_with(".before-install") || !entry.path().is_file() {
+                continue;
+            }
+            copied += import_file(&entry.path(), &dst_data.join(&name))? as usize;
+        }
+    }
+    Ok(copied)
 }
 
 pub fn config_path() -> PathBuf {
@@ -168,7 +247,7 @@ impl Config {
                 }
                 Ok(cfg)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config { notifications: true, ..Default::default() }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("Cannot read {}: {e}", path.display())),
         }
     }

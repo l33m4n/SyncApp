@@ -113,6 +113,8 @@ pub fn install() -> Result<String, String> {
     stop_tray()?;
 
     std::fs::copy(&exe, &target).map_err(|e| format!("copying to {}: {e}", target.display()))?;
+    // Carry this copy's settings and history over to where the installed copy keeps them.
+    let imported = syncapp::config::Config::import_into_standard_folders_logged()?;
     win::set_autostart(Some(&format!("\"{}\" --tray", target.display()))).map_err(|e| e.to_string())?;
 
     // Start menu shortcut (WScript.Shell via PowerShell; values passed as env vars, not code).
@@ -128,8 +130,11 @@ pub fn install() -> Result<String, String> {
         .creation_flags_no_window()
         .status();
 
-    Command::new(&target).arg("--tray").spawn().map_err(|e| e.to_string())?;
-    syncapp::info!("Installed to {}", target.display());
+    // Start the installed copy with the standard folders (like it will at sign-in), and
+    // reopen the window from there; this window then closes.
+    Command::new(&target).arg("--tray").env_remove("SYNCAPP_HOME").spawn().map_err(|e| e.to_string())?;
+    Command::new(&target).arg(AFTER_UPDATE).env_remove("SYNCAPP_HOME").spawn().map_err(|e| e.to_string())?;
+    syncapp::info!("Installed to {} ({imported} settings/history file(s) carried over)", target.display());
     Ok(format!(
         "Installed to {}. SyncApp now starts with Windows and is in your Start menu. You can delete the copy you ran this from.",
         dir.display()
