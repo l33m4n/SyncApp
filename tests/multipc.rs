@@ -207,3 +207,26 @@ fn a_source_folder_that_is_temporarily_missing_is_not_treated_as_deleted() {
     assert_eq!(r.missing_sources.len(), 1);
     assert!(engine::find_orphans(&e.drive, &["Docs".to_string()], "a").is_empty());
 }
+
+#[test]
+fn a_new_pc_can_be_set_up_like_the_one_that_made_the_backup() {
+    let e = env();
+    write_at(&e.a.join("taxes/2024.pdf"), b"pdf", 100);
+    backup(&e, "a");
+    // A brand-new PC with nothing configured.
+    let fresh = syncapp::config::Config::default();
+    let (adopt, from) = syncapp::service::sources_to_adopt(&fresh, &e.drive);
+    assert_eq!(from, "A");
+    assert_eq!(adopt.len(), 1);
+    assert_eq!(adopt[0].name, "Docs");
+    assert_eq!(adopt[0].path, e.a);
+    // Files go back exactly where they were on PC A.
+    assert_eq!(
+        syncapp::service::original_path_from(&adopt, "Docs/taxes/2024.pdf"),
+        Some(e.a.join("taxes").join("2024.pdf"))
+    );
+    // Once the PC has a source by that name, nothing more is offered.
+    let mut set_up = fresh.clone();
+    set_up.sources = adopt;
+    assert!(syncapp::service::sources_to_adopt(&set_up, &e.drive).0.is_empty());
+}

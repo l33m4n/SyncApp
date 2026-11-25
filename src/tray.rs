@@ -28,13 +28,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use syncapp::config::{config_path, Config, DriveReg};
 use syncapp::engine::{human_bytes, Event};
 use syncapp::planner::Planner;
+use syncapp::toast::Action;
 use syncapp::schedule::Clock;
 use syncapp::service::{self, Identity};
 use syncapp::win::{self, wide, NamedLock};
 use syncapp::{info, warn};
 
-pub const TRAY_LOCK: &str = "Local\\SyncApp-Tray";
-pub const TRAY_CLASS: &str = "SyncAppTrayHost";
+/// Name of the background service's single-instance lock. Tests set SYNCAPP_INSTANCE so
+/// their copy can run next to a real one.
+pub fn tray_lock() -> String {
+    format!("Local\\SyncApp-Tray{}", instance_suffix())
+}
+
+/// Window class of the background service's hidden window (found by the manager).
+pub fn tray_class() -> String {
+    format!("SyncAppTrayHost{}", instance_suffix())
+}
+
+fn instance_suffix() -> String {
+    std::env::var("SYNCAPP_INSTANCE").map(|s| format!("-{s}")).unwrap_or_default()
+}
 /// Posted by the manager window when settings changed. WPARAM flags say what else changed.
 pub const WM_SYNCAPP_RELOAD: u32 = WM_APP + 2;
 /// A drive was marked or unmarked: re-identify plugged-in drives.
@@ -95,6 +108,8 @@ struct State {
     last_backup: HashMap<String, u64>,
     /// Files that failed in each drive's last backup (to avoid repeating the same warning).
     last_failed: HashMap<String, Vec<String>>,
+    /// Unix time of each drive's last verification.
+    last_verify: HashMap<String, u64>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -108,6 +123,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         last_attempt: HashMap::new(),
         last_backup: HashMap::new(),
         last_failed: HashMap::new(),
+        last_verify: HashMap::new(),
         workers: Vec::new(),
     })
 });
@@ -173,6 +189,16 @@ fn add_icon() {
 }
 
 pub fn notify(title: &str, body: &str, warning: bool) {
+    notify_with(title, body, warning, &[]);
+}
+
+/// Notification with action buttons. Uses a modern Windows notification, or the classic
+/// tray balloon if that isn't available. Clicking either opens SyncApp.
+pub fn notify_with(title: &str, body: &str, warning: bool, buttons: &[(&str, Action)]) {
+    let click = if buttons.iter().any(|b| b.1 == Action::ShowUpdate) { Action::ShowUpdate } else { Action::Open };
+    if syncapp::toast::show(title, body, click, buttons) {
+        return;
+    }
     let mut nid = base_nid();
     nid.uFlags = NIF_INFO;
     copy_wide(&mut nid.szInfoTitle, title);
@@ -201,16 +227,23 @@ fn update_tip() {
 // ------------------------------------------------------------------ main loop
 
 pub fn run() {
-    let Ok(Some(_lock)) = NamedLock::try_acquire(TRAY_LOCK) else {
+    let Ok(Some(_lock)) = NamedLock::try_acquire(&tray_lock()) else {
         return; // already running
     };
     win::enable_efficiency_mode();
     info!("Background service started");
+    // Register notifications/links with Windows (skipped by automated tests).
+    if std::env::var_os("SYNCAPP_NO_OS_INTEGRATION").is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            syncapp::toast::register(&exe);
+        }
+    }
     reload_config(true);
     state().last_backup = service::last_backups();
+    state().last_verify = service::last_verifies();
     unsafe {
         let hinst = GetModuleHandleW(null());
-        let class = wide(TRAY_CLASS);
+        let class = wide(tray_class());
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
         wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
         wc.lpfnWndProc = Some(wndproc);
@@ -262,6 +295,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     TIMER_UPDATE => {
                         SetTimer(h, TIMER_UPDATE, UPDATE_EVERY_MS, None);
                         maybe_check_for_update();
+                        check_reminders();
                     }
                     _ => {
                         // Safety net, once a minute: catches anything the events missed.
@@ -293,6 +327,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 if wp & RELOAD_HISTORY != 0 {
                     state().last_backup = service::last_backups();
+                    state().last_verify = service::last_verifies();
                 }
                 reschedule();
                 0
@@ -524,13 +559,57 @@ fn rescan_backup_drives() {
     st.known_mask = win::drive_mask();
 }
 
+// ------------------------------------------------------------------ reminders
+
+fn reminders_path() -> std::path::PathBuf {
+    syncapp::config::data_dir().join("reminders.json")
+}
+
+/// Remind (at most once a day per drive) about backup drives that haven't been backed up
+/// for longer than their setting and aren't plugged in right now.
+fn check_reminders() {
+    reload_config(false);
+    let now = win::now_unix();
+    let due: Vec<(String, String, u64)> = {
+        let st = state();
+        let plugged: Vec<&String> = st.backup_drives.values().collect();
+        syncapp::planner::overdue(&st.cfg, &st.last_backup, now)
+            .into_iter()
+            .filter(|(id, _)| !plugged.contains(&id))
+            .filter_map(|(id, days)| st.cfg.drive(&id).map(|d| (id, d.name.clone(), days)))
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    let mut reminded: HashMap<String, u64> =
+        std::fs::read(reminders_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    for (id, name, days) in due {
+        if reminded.get(&id).is_some_and(|t| now.saturating_sub(*t) < 20 * 3600) {
+            continue;
+        }
+        let when = if days == 1 { "a day".to_string() } else { format!("{days} days") };
+        notify_with(
+            &format!("Time to back up to {name}"),
+            &format!("{name} hasn't been backed up for {when}. Plug it in and SyncApp will back it up."),
+            true,
+            &[("Open SyncApp", Action::Open)],
+        );
+        info!("Reminded: '{name}' not backed up for {when}");
+        reminded.insert(id, now);
+    }
+    if let Ok(b) = serde_json::to_vec(&reminded) {
+        let _ = syncapp::engine::atomic_write(&reminders_path(), &b);
+    }
+}
+
 // ------------------------------------------------------------------ updates
 
 /// Check GitHub for a new version if automatic checks are on and the last check is a
 /// day old; notify once per new version. Runs on a worker thread (network).
 fn maybe_check_for_update() {
     reload_config(false);
-    if !state().cfg.check_updates {
+    if !state().cfg.check_updates || syncapp::update::is_dev_build() {
         return;
     }
     let st = syncapp::update::load_state();
@@ -543,10 +622,11 @@ fn maybe_check_for_update() {
             Ok(Some(rel)) => {
                 let mut st = syncapp::update::load_state();
                 if st.notified.as_deref() != Some(rel.version.as_str()) {
-                    notify(
+                    notify_with(
                         &format!("SyncApp {} is available", rel.version),
-                        "Click here to open SyncApp and update (it takes a few seconds).",
+                        "Updating takes a few seconds; your settings and backups aren't affected.",
                         false,
+                        &[("Update now", Action::ShowUpdate), ("Later", Action::Open)],
                     );
                     st.notified = Some(rel.version.clone());
                     syncapp::update::save_state(&st);
@@ -713,6 +793,37 @@ fn start_backup(cfg: Config, root: String, reg: DriveReg, trigger: Trigger) {
                 // A scheduled backup that keeps failing is announced once, not every retry.
                 if trigger != Trigger::Scheduled || first_failure {
                     notify(&format!("Backup to {} didn't run", reg.name), &e, true);
+                }
+            }
+        }
+        // Periodic integrity check, right after a successful backup while the drive is in.
+        if completed && !CANCEL.load(Ordering::Relaxed) && Path::new(&root).exists() {
+            let last_v = state().last_verify.get(&reg.drive_id).copied();
+            if syncapp::planner::verify_due(&reg, last_v, true, win::now_unix()) {
+                set_status(format!("Checking {}...", reg.name));
+                info!("Automatic verification of '{}' (every {} days)", reg.name, reg.verify_every_days);
+                match service::verify(&root, &reg, &CANCEL, None) {
+                    Ok(v) if v.aborted.is_none() => {
+                        state().last_verify.insert(reg.drive_id.clone(), win::now_unix());
+                        let bad = v.problems();
+                        if bad > 0 {
+                            // Damaged files were forgotten by verify: copy them again right away.
+                            let fixed = service::backup_drive(&cfg, &root, &reg, &CANCEL, None)
+                                .map(|r| r.copied.len())
+                                .unwrap_or(0);
+                            notify(
+                                &format!("{}: damaged files found", reg.name),
+                                &format!(
+                                    "The automatic check found {bad} damaged or missing file(s); {fixed} were copied again from this PC. See History for details."
+                                ),
+                                true,
+                            );
+                        } else if notify_on {
+                            notify(&format!("{} checked", reg.name), &format!("All {} backed-up files are intact.", v.ok), false);
+                        }
+                    }
+                    Ok(_) => info!("Automatic verification of '{}' was interrupted", reg.name),
+                    Err(e) => info!("Automatic verification of '{}' skipped: {e}", reg.name),
                 }
             }
         }

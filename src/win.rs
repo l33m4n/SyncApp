@@ -232,6 +232,68 @@ pub fn shell_open(target: &Path) {
     }
 }
 
+// ---------------------------------------------------------------- per-user registry helpers
+
+/// Set a string value under HKCU\<subkey> (created if needed).
+pub fn reg_set_str(subkey: &str, name: &str, value: &str) -> io::Result<()> {
+    let data = wide(value);
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            wide(subkey).as_ptr(),
+            if name.is_empty() { null() } else { wide(name).as_ptr() },
+            REG_SZ,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc as i32)) }
+}
+
+/// Set a DWORD value under HKCU\<subkey>.
+pub fn reg_set_dword(subkey: &str, name: &str, value: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Registry::REG_DWORD;
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            wide(subkey).as_ptr(),
+            wide(name).as_ptr(),
+            REG_DWORD,
+            (&value as *const u32).cast(),
+            4,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc as i32)) }
+}
+
+/// Read a string value under HKCU\<subkey>.
+pub fn reg_get_str(subkey: &str, name: &str) -> Option<String> {
+    let mut buf = vec![0u16; 2048];
+    let mut size = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(subkey).as_ptr(),
+            if name.is_empty() { null() } else { wide(name).as_ptr() },
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    (rc == 0).then(|| from_wide(&buf))
+}
+
+/// Delete HKCU\<subkey> and everything under it (missing is fine).
+pub fn reg_delete_tree(subkey: &str) {
+    use windows_sys::Win32::System::Registry::{RegDeleteKeyW, RegDeleteTreeW};
+    let k = wide(subkey);
+    unsafe {
+        RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
+        RegDeleteKeyW(HKEY_CURRENT_USER, k.as_ptr());
+    }
+}
+
 // ---------------------------------------------------------------- autostart (HKCU Run key)
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

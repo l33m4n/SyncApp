@@ -26,6 +26,10 @@ const MANAGER_LOCK: &str = "Local\\SyncApp-Manager";
 
 /// Started by the updater to open the new version's window.
 const AFTER_UPDATE: &str = "--after-update";
+/// Started by Windows Settings > Apps > Installed apps > Uninstall.
+const UNINSTALL_ARG: &str = "--uninstall";
+/// Our entry in Windows' list of installed apps.
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\SyncApp";
 
 fn main() {
     win::suppress_error_dialogs();
@@ -37,9 +41,17 @@ fn main() {
     syncapp::config::Config::ensure_pc_id();
     syncapp::update::cleanup_after_update();
     if arg.as_deref() == Some("--tray") {
+        refresh_installed_version();
         tray::run();
         return;
     }
+    if arg.as_deref() == Some(UNINSTALL_ARG) {
+        uninstall_from_windows_settings();
+        return;
+    }
+    // Opened from a notification button (a "syncapp:" link). Only known actions exist.
+    let link = arg.as_deref().and_then(syncapp::toast::Action::from_uri);
+    let show_update = link == Some(syncapp::toast::Action::ShowUpdate);
     // After an update the previous version's window is still closing: wait for it rather
     // than mistaking it for an already-open SyncApp.
     let lock = if just_updated {
@@ -54,7 +66,7 @@ fn main() {
     if !tray_running() {
         spawn_tray();
     }
-    if let Err(e) = gui::run() {
+    if let Err(e) = gui::run(show_update) {
         error_box(&format!("SyncApp couldn't open its window:\n\n{e}"));
     }
 }
@@ -74,14 +86,14 @@ fn focus_existing_manager() {
 }
 
 pub fn tray_running() -> bool {
-    !matches!(NamedLock::try_acquire(tray::TRAY_LOCK), Ok(Some(_)))
+    !matches!(NamedLock::try_acquire(&tray::tray_lock()), Ok(Some(_)))
 }
 
 /// Tell the background service that settings changed (cheap; no polling needed).
 /// `flags`: tray::RELOAD_DRIVES and/or tray::RELOAD_HISTORY for what else changed.
 pub fn poke_tray(flags: usize) {
     unsafe {
-        let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
+        let h = FindWindowW(wide(tray::tray_class()).as_ptr(), null());
         if !h.is_null() {
             PostMessageW(h, tray::WM_SYNCAPP_RELOAD, flags, 0);
         }
@@ -116,6 +128,7 @@ pub fn install() -> Result<String, String> {
     // Carry this copy's settings and history over to where the installed copy keeps them.
     let imported = syncapp::config::Config::import_into_standard_folders_logged()?;
     win::set_autostart(Some(&format!("\"{}\" --tray", target.display()))).map_err(|e| e.to_string())?;
+    register_installed_app(&target, &dir).map_err(|e| format!("couldn't add SyncApp to Installed apps: {e}"))?;
 
     // Start menu shortcut (WScript.Shell via PowerShell; values passed as env vars, not code).
     let programs = start_menu_dir();
@@ -141,6 +154,55 @@ pub fn install() -> Result<String, String> {
     ))
 }
 
+/// List SyncApp in Windows Settings > Apps > Installed apps (per user, no admin needed).
+fn register_installed_app(exe: &std::path::Path, dir: &std::path::Path) -> std::io::Result<()> {
+    let exe_s = exe.display().to_string();
+    win::reg_set_str(UNINSTALL_KEY, "DisplayName", "SyncApp")?;
+    win::reg_set_str(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))?;
+    win::reg_set_str(UNINSTALL_KEY, "Publisher", "SyncApp")?;
+    win::reg_set_str(UNINSTALL_KEY, "DisplayIcon", &format!("{exe_s},0"))?;
+    win::reg_set_str(UNINSTALL_KEY, "InstallLocation", &dir.display().to_string())?;
+    win::reg_set_str(UNINSTALL_KEY, "UninstallString", &format!("\"{exe_s}\" {UNINSTALL_ARG}"))?;
+    win::reg_set_str(UNINSTALL_KEY, "URLInfoAbout", env!("CARGO_PKG_REPOSITORY"))?;
+    win::reg_set_dword(UNINSTALL_KEY, "NoModify", 1)?;
+    win::reg_set_dword(UNINSTALL_KEY, "NoRepair", 1)?;
+    let kb = std::fs::metadata(exe).map(|m| (m.len() / 1024) as u32).unwrap_or(0);
+    win::reg_set_dword(UNINSTALL_KEY, "EstimatedSize", kb)?;
+    Ok(())
+}
+
+/// Keep the version shown in Installed apps current after an update.
+fn refresh_installed_version() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    if exe == install_dir().join(EXE_NAME) && win::reg_get_str(UNINSTALL_KEY, "DisplayName").is_some() {
+        if win::reg_get_str(UNINSTALL_KEY, "DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+            let _ = win::reg_set_str(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"));
+        }
+    }
+}
+
+/// Windows Settings > Installed apps > SyncApp > Uninstall.
+fn uninstall_from_windows_settings() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO};
+    let ask = "Uninstall SyncApp?\n\nThis removes the program, its background service and its startup entry. \
+               Your settings are kept, and backups on your drives are never touched.";
+    let yes = unsafe { MessageBoxW(null_mut(), wide(ask).as_ptr(), wide("SyncApp").as_ptr(), MB_YESNO | MB_ICONQUESTION) };
+    if yes != IDYES {
+        return;
+    }
+    let msg = match uninstall(false) {
+        Ok(m) => m,
+        Err(e) => format!("SyncApp couldn't be uninstalled: {e}"),
+    };
+    unsafe { MessageBoxW(null_mut(), wide(&msg).as_ptr(), wide("SyncApp").as_ptr(), MB_ICONINFORMATION) };
+}
+
+/// Remove the notification and "syncapp:" link registrations made by the tray.
+fn unregister_windows_integration() {
+    win::reg_delete_tree(r"Software\Classes\syncapp");
+    win::reg_delete_tree(r"Software\Classes\AppUserModelId\SyncApp");
+}
+
 fn start_menu_dir() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join(r"Microsoft\Windows\Start Menu\Programs")
 }
@@ -148,7 +210,7 @@ fn start_menu_dir() -> PathBuf {
 /// Ask the background service to exit and wait for it (it refuses while a backup runs).
 fn stop_tray() -> Result<(), String> {
     unsafe {
-        let h = FindWindowW(wide(tray::TRAY_CLASS).as_ptr(), null());
+        let h = FindWindowW(wide(tray::tray_class()).as_ptr(), null());
         if !h.is_null() {
             PostMessageW(h, WM_CLOSE, 0, 0);
         }
@@ -169,8 +231,11 @@ fn stop_tray() -> Result<(), String> {
 pub fn uninstall(remove_data: bool) -> Result<String, String> {
     stop_tray()?;
     syncapp::info!("Uninstalling (remove settings: {remove_data})");
+    // Remove every trace from Windows, whichever copy registered it.
     win::set_autostart(None).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(start_menu_dir().join("SyncApp.lnk"));
+    win::reg_delete_tree(UNINSTALL_KEY);
+    unregister_windows_integration();
 
     let dir = install_dir();
     let exe = std::env::current_exe().unwrap_or_default();

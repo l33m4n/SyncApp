@@ -351,6 +351,9 @@ impl Entry {
 pub struct PcInfo {
     pub name: String,
     pub last_backup: u64,
+    /// What this PC backs up and where it lives, so a new PC can be set up the same way.
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -907,13 +910,19 @@ pub fn run_backup(
             }
         }
         if manifest.dirty && last_save.elapsed() > save_every {
-            manifest.pcs.insert(pc.id.clone(), PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix() });
+            manifest.pcs.insert(
+            pc.id.clone(),
+            PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix(), sources: sources.to_vec() },
+        );
             let _ = manifest.save();
             last_save = Instant::now();
         }
     }
     if manifest.dirty && drive_root.exists() {
-        manifest.pcs.insert(pc.id.clone(), PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix() });
+        manifest.pcs.insert(
+            pc.id.clone(),
+            PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix(), sources: sources.to_vec() },
+        );
         if let Err(e) = manifest.save() {
             crate::warn!("Could not save manifest: {e}");
         }
@@ -1097,6 +1106,14 @@ pub struct BackupFile {
     pub hash: Option<String>,
     /// Name of the PC that wrote the copy on the drive, if known.
     pub from_pc: Option<String>,
+}
+
+/// The PCs that back up to a drive, newest first: (PC name, last backup, its sources).
+pub fn drive_pcs(drive_root: &Path) -> Vec<(String, u64, Vec<Source>)> {
+    let m = Manifest::load(drive_root);
+    let mut v: Vec<(String, u64, Vec<Source>)> = m.pcs.into_values().map(|p| (p.name, p.last_backup, p.sources)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
 }
 
 /// Every file in the backup folder on a drive, joined with the manifest.

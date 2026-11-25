@@ -14,6 +14,14 @@ fn yes() -> bool {
     true
 }
 
+fn seven() -> u32 {
+    7
+}
+
+fn thirty() -> u32 {
+    30
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Source {
     /// Folder name used on the drive, e.g. "Documents" -> X:\SyncApp Backup\Documents\...
@@ -75,6 +83,12 @@ pub struct DriveReg {
     pub repeat_minutes: u32,
     #[serde(default)]
     pub registered_at: u64,
+    /// Remind me if this drive hasn't been backed up for this many days (0 = never).
+    #[serde(default = "seven")]
+    pub remind_after_days: u32,
+    /// Verify the drive automatically every this many days, when plugged in (0 = never).
+    #[serde(default = "thirty")]
+    pub verify_every_days: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

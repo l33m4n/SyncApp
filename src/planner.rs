@@ -95,6 +95,34 @@ impl Planner<'_> {
     }
 }
 
+const DAY_S: u64 = 86_400;
+
+/// Drives that haven't been backed up for longer than their reminder setting:
+/// (drive id, whole days since the last backup, or since it was added if never).
+/// Skipped while automatic backups are paused.
+pub fn overdue(cfg: &Config, last_backup: &HashMap<String, u64>, now: u64) -> Vec<(String, u64)> {
+    if cfg.paused {
+        return vec![];
+    }
+    cfg.drives
+        .iter()
+        .filter(|d| d.remind_after_days > 0)
+        .filter_map(|d| {
+            let since = last_backup.get(&d.drive_id).copied().unwrap_or(d.registered_at);
+            let days = now.saturating_sub(since) / DAY_S;
+            (since > 0 && days >= d.remind_after_days as u64).then(|| (d.drive_id.clone(), days))
+        })
+        .collect()
+}
+
+/// Should a plugged-in drive be verified now? Only once it has a backup, and when the
+/// last verification is older than its setting.
+pub fn verify_due(d: &DriveReg, last_verify: Option<u64>, has_backup: bool, now: u64) -> bool {
+    d.verify_every_days > 0
+        && has_backup
+        && last_verify.is_none_or(|t| now.saturating_sub(t) >= d.verify_every_days as u64 * DAY_S)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +149,8 @@ mod tests {
             schedule,
             repeat_minutes: 0,
             registered_at: 0,
+            remind_after_days: 7,
+            verify_every_days: 30,
         }
     }
 
@@ -194,6 +224,38 @@ mod tests {
         assert_eq!(w.planner().next_wake(&clock(12, 0)), Some(clock(12, 0).now + RETRY_AFTER_S - 120));
         w.failed.insert("hourly".into(), RETRY_AFTER_S);
         assert_eq!(w.planner().due(&clock(12, 0)).len(), 1);
+    }
+
+    #[test]
+    fn reminders_for_drives_not_backed_up_recently() {
+        let mut w = World::new();
+        let now = 100 * DAY_S;
+        w.last.insert("hourly".into(), now - 3 * DAY_S); // 3 days ago: fine
+        w.last.insert("thrice".into(), now - 9 * DAY_S); // 9 days ago: overdue
+        // "off" never backed up; added 8 days ago: overdue.
+        w.cfg.drive_mut("off").unwrap().registered_at = now - 8 * DAY_S;
+        let mut o = overdue(&w.cfg, &w.last, now);
+        o.sort();
+        assert_eq!(o, vec![("off".to_string(), 8), ("thrice".to_string(), 9)]);
+        w.cfg.drive_mut("thrice").unwrap().remind_after_days = 0; // reminders off
+        w.cfg.drive_mut("off").unwrap().remind_after_days = 14; // longer threshold
+        assert!(overdue(&w.cfg, &w.last, now).is_empty());
+        w.cfg.paused = true;
+        w.last.clear();
+        assert!(overdue(&w.cfg, &w.last, now).is_empty());
+    }
+
+    #[test]
+    fn periodic_verification() {
+        let d = drive("x", Schedule::Off);
+        let now = 100 * DAY_S;
+        assert!(verify_due(&d, None, true, now), "never verified");
+        assert!(!verify_due(&d, None, false, now), "nothing backed up yet");
+        assert!(!verify_due(&d, Some(now - 10 * DAY_S), true, now));
+        assert!(verify_due(&d, Some(now - 30 * DAY_S), true, now));
+        let mut off = d.clone();
+        off.verify_every_days = 0;
+        assert!(!verify_due(&off, None, true, now));
     }
 
     #[test]

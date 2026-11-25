@@ -69,6 +69,9 @@ jobs:
 
       - name: Build
         run: cargo build --release
+        env:
+          # Published builds (main) are marked as releases; others are development builds.
+          SYNCAPP_RELEASE_BUILD: ${{ steps.version.outputs.value }}
 
       - name: Upload SyncApp.exe
         uses: actions/upload-artifact@v4
@@ -88,6 +91,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.build.outputs.version }}
       COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+      SIGNING_KEY: ${{ secrets.SYNCAPP_SIGNING_KEY }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -99,6 +103,19 @@ jobs:
           cd dist
           sha256sum SyncApp.exe > SyncApp.exe.sha256
           cat SyncApp.exe.sha256
+          # Sign the exe. Installed copies refuse updates without a valid signature, so an
+          # unsigned release would be useless: stop here if the key isn't configured.
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::Repository secret SYNCAPP_SIGNING_KEY is not set, so the release can't be signed. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing-key.pem"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/signing-key.pem" -out SyncApp.exe.sig SyncApp.exe
+          rm -f "$RUNNER_TEMP/signing-key.pem"
+          openssl ec -in /dev/stdin -pubout 2>/dev/null <<< "$SIGNING_KEY" > pub.pem
+          openssl dgst -sha256 -verify pub.pem -signature SyncApp.exe.sig SyncApp.exe
+          rm -f pub.pem
           {
             echo "SyncApp $VERSION, built automatically from commit ${GITHUB_SHA::7}."
             echo
@@ -107,7 +124,7 @@ jobs:
             echo "$COMMIT_MESSAGE"
           } > notes.md
           gh release delete release --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
-          gh release create release SyncApp.exe SyncApp.exe.sha256 \
+          gh release create release SyncApp.exe SyncApp.exe.sha256 SyncApp.exe.sig \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "SyncApp $VERSION" \

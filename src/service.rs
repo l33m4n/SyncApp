@@ -87,6 +87,8 @@ pub fn register_drive(cfg: &mut Config, root: &str, name: Option<&str>) -> Resul
                 schedule: Default::default(),
                 repeat_minutes: 0,
                 registered_at: win::now_unix(),
+                remind_after_days: 7,
+                verify_every_days: 30,
             };
             cfg.drives.push(reg.clone());
             reg
@@ -222,8 +224,32 @@ pub fn restore_files(
 /// remainder is exactly the source's own file name means a single-file source, anything
 /// else means a folder.
 pub fn original_path(cfg: &Config, key: &str) -> Option<PathBuf> {
+    original_path_from(&cfg.sources, key)
+}
+
+/// Sources on the drive that this PC doesn't have yet (by name), taken from the most
+/// recent PC that backs each one up: (sources, name of the PC they come from).
+pub fn sources_to_adopt(cfg: &Config, drive_root: &Path) -> (Vec<crate::config::Source>, String) {
+    let mut out: Vec<crate::config::Source> = Vec::new();
+    let mut from = String::new();
+    for (pc, _, sources) in engine::drive_pcs(drive_root) {
+        for s in sources {
+            let known = cfg.sources.iter().chain(out.iter()).any(|c| c.name.eq_ignore_ascii_case(&s.name));
+            if !known {
+                if from.is_empty() {
+                    from = pc.clone();
+                }
+                out.push(s);
+            }
+        }
+    }
+    (out, from)
+}
+
+/// Like `original_path`, using the given list of sources (e.g. another PC's, from the drive).
+pub fn original_path_from(sources: &[crate::config::Source], key: &str) -> Option<PathBuf> {
     let (name, rel) = key.split_once('/')?;
-    let src = cfg.sources.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
+    let src = sources.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
     let file_name = src.path.file_name()?.to_string_lossy().into_owned();
     let is_file = match src.kind() {
         Some(SourceKind::File) => true,
@@ -372,6 +398,17 @@ pub fn last_backups() -> std::collections::HashMap<String, u64> {
     let mut m = std::collections::HashMap::new();
     for r in history_load() {
         if r.kind == "backup" {
+            m.insert(r.drive_id, r.finished_at);
+        }
+    }
+    m
+}
+
+/// Finish time of the latest verification for every drive.
+pub fn last_verifies() -> std::collections::HashMap<String, u64> {
+    let mut m = std::collections::HashMap::new();
+    for r in history_load() {
+        if r.kind == "verify" {
             m.insert(r.drive_id, r.finished_at);
         }
     }

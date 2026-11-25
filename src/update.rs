@@ -4,8 +4,11 @@
 //!   over HTTPS, and only published (non-draft, non-prerelease) releases count.
 //! * CI publishes every build of `main` as one rolling release with the tag `release`,
 //!   titled "SyncApp X.Y.Z"; the version is read from the title.
-//! * A release is only offered for installation if it includes `SyncApp.exe` and a
-//!   `SyncApp.exe.sha256` checksum; the download must match the checksum exactly.
+//! * A release is only offered for installation if it includes `SyncApp.exe`, its
+//!   `SyncApp.exe.sha256` checksum and `SyncApp.exe.sig`, an ECDSA P-256 signature made
+//!   with the project's private release key (kept as a GitHub secret). The download must
+//!   match the checksum and the signature must verify against the public key built into
+//!   this app, so a release published by anyone without that key is refused.
 //! * Nothing is installed without the user clicking "Update now".
 
 use std::fs;
@@ -18,8 +21,23 @@ use crate::config::data_dir;
 use crate::engine::atomic_write;
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// A local build rather than one published by CI. Its version number may lag behind
+/// the releases, so it doesn't nag about updates on its own (manual checks still work).
+pub fn is_dev_build() -> bool {
+    env!("SYNCAPP_BUILD") != "release"
+}
+
+/// "0.1.3", or "0.1.1 (development build)".
+pub fn version_label() -> String {
+    if is_dev_build() { format!("{CURRENT} (development build)") } else { CURRENT.to_string() }
+}
 const EXE_ASSET: &str = "SyncApp.exe";
 const SUM_ASSET: &str = "SyncApp.exe.sha256";
+const SIG_ASSET: &str = "SyncApp.exe.sig";
+/// Public half of the release signing key (P-256, raw X||Y). The private half never
+/// leaves the maintainer and the CI secret SYNCAPP_SIGNING_KEY.
+const RELEASE_PUBLIC_KEY: &str = "025f1da86d13d4cafc4905017fc16bb8e3faa31c3b7231f9c8d43ab85e5c03d0a33371c2c466f5ae29e471ae1c2c14424754c6e534f16a4da6e8c73e612a0eeb";
 /// Tag of the rolling release CI replaces on every build of main.
 const ROLLING_TAG: &str = "release";
 /// Background checks happen at most this often.
@@ -31,6 +49,8 @@ pub struct Release {
     pub page_url: String,
     pub exe_url: String,
     pub sha_url: String,
+    #[serde(default)]
+    pub sig_url: String,
     pub size: u64,
     /// Release notes (Markdown), shortened.
     pub notes: String,
@@ -130,10 +150,10 @@ pub fn parse_release(json: &[u8]) -> Result<Option<Release>, String> {
         return Ok(None);
     }
     let find = |n: &str| r.assets.iter().find(|a| a.name.eq_ignore_ascii_case(n));
-    let (Some(exe), Some(sum)) = (find(EXE_ASSET), find(SUM_ASSET)) else {
-        return Ok(None); // not installable automatically
+    let (Some(exe), Some(sum), Some(sig)) = (find(EXE_ASSET), find(SUM_ASSET), find(SIG_ASSET)) else {
+        return Ok(None); // not installable automatically (unsigned or incomplete)
     };
-    if !exe.browser_download_url.starts_with("https://") || !sum.browser_download_url.starts_with("https://") {
+    if [exe, sum, sig].iter().any(|a| !a.browser_download_url.starts_with("https://")) {
         return Ok(None);
     }
     let mut notes = r.body.unwrap_or_default();
@@ -154,6 +174,7 @@ pub fn parse_release(json: &[u8]) -> Result<Option<Release>, String> {
         page_url: r.html_url,
         exe_url: exe.browser_download_url.clone(),
         sha_url: sum.browser_download_url.clone(),
+        sig_url: sig.browser_download_url.clone(),
         size: exe.size,
         notes,
     }))
@@ -211,13 +232,24 @@ pub fn download(rel: &Release, cancel: &AtomicBool, progress: &mut dyn FnMut(u64
         return Err(format!("couldn't get the checksum (HTTP {status})"));
     }
     let expected = parse_checksum(&String::from_utf8_lossy(&sum)).ok_or("the release's checksum file is invalid")?;
+    if rel.sig_url.is_empty() {
+        return Err("this release isn't signed, so it can't be installed automatically".into());
+    }
+    let (status, signature) = crate::net::get(&rel.sig_url, 512)?;
+    if status != 200 {
+        return Err(format!("couldn't get the release signature (HTTP {status})"));
+    }
     let part = dir.join(format!("SyncApp-{}.exe.part", rel.version));
     let done = dir.join(format!("SyncApp-{}.exe", rel.version));
     let res = (|| {
         crate::net::download(&rel.exe_url, &part, cancel, progress)?;
-        let actual = crate::net::sha256_file(&part)?;
+        let digest = crate::net::sha256_file_raw(&part)?;
+        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         if actual != expected {
             return Err("the download doesn't match the published checksum, so it was discarded".to_string());
+        }
+        if !signature_ok(&digest, &signature) {
+            return Err("the download isn't signed with SyncApp's release key, so it was discarded".to_string());
         }
         let head = fs::read(&part).map_err(|e| e.to_string())?;
         if !head.starts_with(b"MZ") {
@@ -233,6 +265,23 @@ pub fn download(rel: &Release, cancel: &AtomicBool, progress: &mut dyn FnMut(u64
     }
     crate::info!("Downloaded and verified SyncApp {}", rel.version);
     Ok(done)
+}
+
+fn hex_to_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Does `signature` (DER) prove the release key signed this SHA-256 digest?
+pub fn signature_ok(digest: &[u8; 32], signature: &[u8]) -> bool {
+    let Some(key) = hex_to_bytes::<64>(RELEASE_PUBLIC_KEY) else { return false };
+    crate::net::verify_p256(&key, digest, signature)
 }
 
 /// The previous exe kept during an update (deleted once the new version is running).
@@ -278,6 +327,28 @@ mod tests {
     }
 
     #[test]
+    fn ecdsa_signatures() {
+        // Test vector made with .NET's ECDsa (DER signature, like OpenSSL produces in CI).
+        let key = hex_to_bytes::<64>("b49820d6459901b85af7079673e7860c881caf5eefafbe7b347a2eb1fbdc66857ca41410ddb391101dbe9087e7228e07dc7f8140973ca033443f256f19b34be3").unwrap();
+        let sig: Vec<u8> = (0..70).map(|i| u8::from_str_radix(&"3044022014f2b552fe3d9b0c912c1a15330755adfe124a8cd990f1e7df9ef178fa1e67d0022049b1237bd7e33d13b5bea14ab26204cae3a4936ec71e2b79099d309926efdba7"[i * 2..i * 2 + 2], 16).unwrap()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("msg");
+        std::fs::write(&f, b"hello SyncApp").unwrap();
+        let digest = crate::net::sha256_file_raw(&f).unwrap();
+        assert!(crate::net::verify_p256(&key, &digest, &sig), "valid signature must verify");
+        // Any change to the file, the signature or the key is rejected.
+        std::fs::write(&f, b"hello SyncApq").unwrap();
+        let other = crate::net::sha256_file_raw(&f).unwrap();
+        assert!(!crate::net::verify_p256(&key, &other, &sig));
+        let mut bad = sig.clone();
+        bad[10] ^= 1;
+        assert!(!crate::net::verify_p256(&key, &digest, &bad));
+        // The real release key doesn't accept the test key's signature.
+        assert!(!signature_ok(&digest, &sig));
+        assert!(crate::net::ecdsa_der_to_raw(b"garbage").is_none());
+    }
+
+    #[test]
     fn checksum_file() {
         let h = "a".repeat(64);
         assert_eq!(parse_checksum(&format!("{h}  SyncApp.exe\n")), Some(h.clone()));
@@ -292,12 +363,13 @@ mod tests {
             "body": "Fixes", "draft": false, "prerelease": false,
             "assets": [
                 {"name": "SyncApp.exe", "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/SyncApp.exe", "size": 123},
-                {"name": "SyncApp.exe.sha256", "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/SyncApp.exe.sha256", "size": 80}
+                {"name": "SyncApp.exe.sha256", "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/SyncApp.exe.sha256", "size": 80},
+                {"name": "SyncApp.exe.sig", "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/SyncApp.exe.sig", "size": 72}
             ]}"#;
         let r = parse_release(json).unwrap().unwrap();
         assert_eq!(r.version, "0.2.0");
         assert_eq!(r.size, 123);
-        // Without a checksum asset, it's not offered for automatic install.
+        // Without a checksum or signature asset, it's not offered for automatic install.
         let no_sum = br#"{"tag_name":"v0.2.0","html_url":"x","assets":[{"name":"SyncApp.exe","browser_download_url":"https://x/SyncApp.exe"}]}"#;
         assert_eq!(parse_release(no_sum).unwrap(), None);
         let pre = br#"{"tag_name":"v9.0.0","html_url":"x","prerelease":true,"assets":[]}"#;
@@ -305,11 +377,18 @@ mod tests {
         // The rolling release: fixed tag, version in the title.
         let rolling = br#"{"tag_name":"release","name":"SyncApp 0.1.7","html_url":"x","assets":[
             {"name":"SyncApp.exe","browser_download_url":"https://x/SyncApp.exe","size":5},
-            {"name":"SyncApp.exe.sha256","browser_download_url":"https://x/SyncApp.exe.sha256","size":5}]}"#;
+            {"name":"SyncApp.exe.sha256","browser_download_url":"https://x/SyncApp.exe.sha256","size":5},
+            {"name":"SyncApp.exe.sig","browser_download_url":"https://x/SyncApp.exe.sig","size":5}]}"#;
         assert_eq!(parse_release(rolling).unwrap().unwrap().version, "0.1.7");
         let untitled = br#"{"tag_name":"release","name":"nightly","html_url":"x","assets":[
             {"name":"SyncApp.exe","browser_download_url":"https://x/SyncApp.exe"},
+            {"name":"SyncApp.exe.sha256","browser_download_url":"https://x/SyncApp.exe.sha256"},
+            {"name":"SyncApp.exe.sig","browser_download_url":"https://x/SyncApp.exe.sig"}]}"#;
+        assert_eq!(parse_release(untitled).unwrap(), None);
+        let unsigned = br#"{"tag_name":"release","name":"SyncApp 0.1.7","html_url":"x","assets":[
+            {"name":"SyncApp.exe","browser_download_url":"https://x/SyncApp.exe"},
             {"name":"SyncApp.exe.sha256","browser_download_url":"https://x/SyncApp.exe.sha256"}]}"#;
+        assert_eq!(parse_release(unsigned).unwrap(), None, "unsigned releases aren't offered");
         assert_eq!(parse_release(untitled).unwrap(), None);
     }
 }

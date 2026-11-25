@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Networking::WinHttp::*;
 use windows_sys::Win32::Security::Cryptography::{
-    BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHashData, BCRYPT_SHA256_ALG_HANDLE,
+    BCryptCreateHash, BCryptDestroyHash, BCryptDestroyKey, BCryptFinishHash, BCryptHashData, BCryptImportKeyPair,
+    BCryptVerifySignature, BCRYPT_ECCKEY_BLOB, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDSA_P256_ALG_HANDLE,
+    BCRYPT_ECDSA_PUBLIC_P256_MAGIC, BCRYPT_SHA256_ALG_HANDLE,
 };
 
 use crate::win::wide;
@@ -155,6 +157,63 @@ pub fn download(
 
 /// SHA-256 of a file, lowercase hex (Windows CNG; no extra dependencies).
 pub fn sha256_file(path: &Path) -> Result<String, String> {
+    sha256_file_raw(path).map(|d| d.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Convert a DER-encoded ECDSA signature (as made by OpenSSL/.NET) to the raw 64-byte
+/// r||s form Windows expects.
+pub fn ecdsa_der_to_raw(der: &[u8]) -> Option<[u8; 64]> {
+    fn int(b: &[u8]) -> Option<(&[u8], &[u8])> {
+        let (&tag, rest) = b.split_first()?;
+        let (&len, rest) = rest.split_first()?;
+        if tag != 0x02 || len as usize > rest.len() || len > 33 {
+            return None;
+        }
+        Some(rest.split_at(len as usize))
+    }
+    let (&tag, rest) = der.split_first()?;
+    let (&len, body) = rest.split_first()?;
+    if tag != 0x30 || len as usize != body.len() {
+        return None;
+    }
+    let (r, rest) = int(body)?;
+    let (s, rest) = int(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, v) in [r, s].iter().enumerate() {
+        let v = &v[v.iter().position(|&x| x != 0).unwrap_or(v.len())..]; // strip sign padding
+        if v.len() > 32 {
+            return None;
+        }
+        out[i * 32 + 32 - v.len()..(i + 1) * 32].copy_from_slice(v);
+    }
+    Some(out)
+}
+
+/// Verify an ECDSA P-256 / SHA-256 signature (DER) over `digest` with a public key
+/// given as raw X||Y (64 bytes). Uses Windows CNG.
+pub fn verify_p256(public_xy: &[u8; 64], digest: &[u8; 32], der_sig: &[u8]) -> bool {
+    let Some(sig) = ecdsa_der_to_raw(der_sig) else { return false };
+    let mut blob = Vec::with_capacity(8 + 64);
+    let header = BCRYPT_ECCKEY_BLOB { dwMagic: BCRYPT_ECDSA_PUBLIC_P256_MAGIC, cbKey: 32 };
+    blob.extend_from_slice(&header.dwMagic.to_le_bytes());
+    blob.extend_from_slice(&header.cbKey.to_le_bytes());
+    blob.extend_from_slice(public_xy);
+    unsafe {
+        let mut key = null_mut();
+        if BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, null_mut(), BCRYPT_ECCPUBLIC_BLOB, &mut key, blob.as_ptr(), blob.len() as u32, 0) != 0 {
+            return false;
+        }
+        let ok = BCryptVerifySignature(key, null(), digest.as_ptr(), 32, sig.as_ptr(), 64, 0) == 0;
+        BCryptDestroyKey(key);
+        ok
+    }
+}
+
+/// SHA-256 of a file as raw bytes.
+pub fn sha256_file_raw(path: &Path) -> Result<[u8; 32], String> {
     use std::io::Read;
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     unsafe {
@@ -171,7 +230,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
             if n == 0 {
                 let mut out = [0u8; 32];
                 break if BCryptFinishHash(h, out.as_mut_ptr(), 32, 0) == 0 {
-                    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+                    Ok(out)
                 } else {
                     Err("hash failed".into())
                 };

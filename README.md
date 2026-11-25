@@ -17,15 +17,19 @@ Pick the folders and files you care about, mark the drives you trust, and SyncAp
 2. **What to back up**: add folders or individual files. You can add skip patterns such as `*.iso` or `node_modules`.
 3. **Backup drives**: plug in a drive and click **Use as backup drive...**.
 4. Done. Whenever that drive is plugged in, changed files are copied and a notification tells you when it's safe to unplug.
-5. **Settings > Install** copies SyncApp to `%LOCALAPPDATA%\Programs\SyncApp`, adds a Start menu entry and starts it at sign-in. **Settings > Uninstall** removes all of that again (backups on your drives are never touched).
+5. **Settings > Install** copies SyncApp to `%LOCALAPPDATA%\Programs\SyncApp`, carries your settings and history over, adds a Start menu entry, starts it at sign-in and lists it in Windows Settings > Apps > Installed apps. Uninstall from there or from **Settings > Uninstall** removes all of that again (backups on your drives are never touched).
+
+Works with any external storage Windows gives a drive letter: USB flash drives, SD cards, and external SSDs and hard drives (NTFS, exFAT or FAT32; FAT32 can't hold files over 4 GB). BitLocker-encrypted drives work once unlocked. Network shares are not supported.
 
 Other features:
 
 - **Per-drive options**: choose which sources go to which drive, turn automatic backup off, and schedule extra backups while the drive stays plugged in (every N minutes/hours, or at set times of day on chosen weekdays). Scheduled runs only notify you when they copied something or hit a problem.
-- **Verify integrity**: re-reads every file on the drive and checks it against the checksum recorded at backup time. Corrupted files are re-copied on the next backup.
+- **Verify integrity**: re-reads every file on the drive and checks it against the checksum recorded at backup time. Corrupted files are re-copied on the next backup. Each drive can also be **verified automatically** (every 30 days by default) right after a backup while it's plugged in; damaged files are copied again straight away.
+- **Reminders**: if a drive hasn't been backed up for a while (7 days by default, per drive), SyncApp reminds you to plug it in.
+- **New PC**: each backup records which folders that PC backs up. On a new PC, Restore offers to set it up the same way, and files go back exactly where they were.
 - **Restore**: browse the backup, search it, and restore selected files or folders to where they came from or to another folder. Each file shows whether it's missing or different on this PC, and which PC backed it up. Existing files are only replaced if you tick the option.
 - **Clean up**: lists backed-up files that no PC has any more (deleted, renamed or moved everywhere, or from folders you stopped backing up), with their total size. Review and delete them to free space; SyncApp never deletes them on its own.
-- **Updates**: once a day SyncApp asks GitHub whether a newer release exists and notifies you (can be turned off). **Update now** downloads it, checks it against the SHA-256 checksum published with the release, and restarts into the new version; it never updates while a backup is running and never installs anything without your click.
+- **Updates**: once a day SyncApp asks GitHub whether a newer release exists and notifies you, with an **Update now** button (can be turned off). Updating downloads the release, checks it against its SHA-256 checksum **and its digital signature** (made with the project's private release key; the app only accepts updates signed with it), and restarts into the new version. It never updates while a backup is running and never installs anything without your click. Local builds are marked as development builds and only check when you ask.
 - **Battery saver**: scheduled backups wait while Windows Battery saver is on (optional; plug-in backups still run).
 - **History**: every backup, verify, restore and clean-up, with any per-file problems.
 - **Pause**: from the tray menu or Settings.
@@ -61,6 +65,10 @@ cargo test                 # all tests
 
 Every push is built and tested on Windows by GitHub Actions (`.github/workflows/ci.yml`), which also keeps `SyncApp.exe` as a build artifact.
 
+### Release signing (one-time setup)
+
+Releases are signed with an ECDSA P-256 key. The public half is built into the app (`RELEASE_PUBLIC_KEY` in `src/update.rs`); the private half must be added to the repository as the Actions secret **`SYNCAPP_SIGNING_KEY`** (the full PEM text, including the BEGIN/END lines). Without it, the release step fails instead of publishing an update installed copies would refuse. Keep a safe copy of the key (e.g. in a password manager): losing it means installed copies can't verify future updates.
+
 ### Releasing an update
 
 Just push to `main`. When the build and tests pass, the workflow:
@@ -95,11 +103,15 @@ src/
   win.rs       Win32 helpers (drives, volume serials, mutexes, registry, power)
   log.rs       log file
   tray.rs      background service: tray icon, plug-in detection, notifications
-  gui.rs       manager window (egui)
+  gui/         manager window (egui): one file per tab, plus shared widgets
+  toast.rs     modern notifications with buttons, "syncapp:" links
+  update.rs    update checks, download, checksum and signature verification
+  net.rs       HTTPS (WinHTTP), SHA-256 and ECDSA verification (Windows CNG)
   main.rs      entry point, install/uninstall, icon
 build.rs       embeds the icon and version info in the exe
 assets/        app icon (regenerate with scripts/make_icon.py)
-tests/         engine, multi-PC/clean-up and restore-path tests
+tests/         engine, multi-PC/clean-up, restore-path, install and background-service tests
+               (the manager window is tested headlessly in src/gui/mod.rs)
 examples/      bench.rs performance check
 ```
 
