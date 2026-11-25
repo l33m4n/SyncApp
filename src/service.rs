@@ -150,7 +150,7 @@ pub fn backup_drive(cfg: &Config, root: &str, reg: &DriveReg, cancel: &AtomicBoo
         return Err("No sources selected for this drive".into());
     }
     crate::info!("Backup to '{}' ({root}) started: {} source(s)", reg.name, sources.len());
-    let report = engine::run_backup(&sources, Path::new(root), cancel, progress);
+    let report = engine::run_backup(&sources, Path::new(root), &cfg.pc(), cancel, progress);
     crate::info!("Backup to '{}' finished: {}", reg.name, report.summary());
     for (k, e) in report.failed.iter().take(20) {
         crate::warn!("  failed: {k}: {e}");
@@ -266,6 +266,13 @@ pub fn describe(reg: &DriveReg, root: &str, r: &Report) -> (String, String, bool
     if !r.missing_sources.is_empty() {
         body += &format!(" {} source folder(s) not found.", r.missing_sources.len());
     }
+    if !r.newer_on_drive.is_empty() {
+        let from = &r.newer_on_drive[0].1;
+        body += &format!(
+            " {} file(s) weren't updated because the drive already has newer versions from {from}.",
+            r.newer_on_drive.len()
+        );
+    }
     if r.ok() {
         body += &format!(" Safe to remove {letter}.");
     }
@@ -373,4 +380,44 @@ pub fn last_backups() -> std::collections::HashMap<String, u64> {
 
 pub fn last_backup(drive_id: &str) -> Option<HistoryRecord> {
     history_load().into_iter().rev().find(|r| r.drive_id == drive_id && r.kind == "backup")
+}
+
+// ------------------------------------------------------------------ clean-up
+
+/// Backed-up files on this drive that no PC needs any more.
+pub fn find_orphans(cfg: &Config, root: &str) -> Vec<engine::Orphan> {
+    let names: Vec<String> = cfg.sources.iter().map(|s| s.name.clone()).collect();
+    engine::find_orphans(Path::new(root), &names, &cfg.pc().id)
+}
+
+/// Permanently delete the given backed-up files, with the drive lock held, and log it.
+pub fn clean_up(
+    root: &str,
+    reg: &DriveReg,
+    keys: &[String],
+    cancel: &AtomicBool,
+    progress: Option<Progress>,
+) -> Result<engine::CleanupReport, String> {
+    let _lock = NamedLock::try_acquire(&drive_lock_name(&reg.drive_id))
+        .map_err(|e| e.to_string())?
+        .ok_or("This drive is busy with a backup")?;
+    crate::info!("Clean-up of {} file(s) on '{}'", keys.len(), reg.name);
+    let r = engine::remove_backed_up(Path::new(root), keys, cancel, progress);
+    crate::info!("Clean-up finished: {} removed ({}), {} failed", r.removed, engine::human_bytes(r.bytes), r.failed.len());
+    let mut errors = r.failed.clone();
+    errors.truncate(HISTORY_ERRORS_MAX);
+    history_append(HistoryRecord {
+        kind: "cleanup".into(),
+        drive_id: reg.drive_id.clone(),
+        drive_name: reg.name.clone(),
+        finished_at: win::now_unix(),
+        ok: r.failed.is_empty() && r.aborted.is_none(),
+        copied: r.removed,
+        unchanged: 0,
+        bytes: r.bytes,
+        duration_ms: 0,
+        detail: format!("Removed {} file(s) no longer needed", r.removed),
+        errors,
+    });
+    Ok(r)
 }

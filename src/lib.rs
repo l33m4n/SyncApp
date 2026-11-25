@@ -2,6 +2,7 @@
 
 #[macro_use]
 pub mod log;
+pub mod planner;
 pub mod config;
 pub mod engine;
 pub mod schedule;

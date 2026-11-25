@@ -26,6 +26,7 @@ const MANAGER_LOCK: &str = "Local\\SyncApp-Manager";
 
 fn main() {
     win::suppress_error_dialogs();
+    syncapp::config::Config::ensure_pc_id();
     if std::env::args().nth(1).as_deref() == Some("--tray") {
         tray::run();
         return;

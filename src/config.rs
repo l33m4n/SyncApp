@@ -88,6 +88,35 @@ pub struct Config {
     /// Pause automatic backups (manual ones still work).
     #[serde(default)]
     pub paused: bool,
+    /// Random ID for this PC, so several PCs can share a backup drive.
+    #[serde(default)]
+    pub pc_id: String,
+    /// Don't run scheduled backups while Windows Battery saver is on
+    /// (backups when a drive is plugged in still happen).
+    #[serde(default = "yes")]
+    pub skip_on_battery_saver: bool,
+}
+
+impl Config {
+    /// This PC's identity for backups (name is the current Windows computer name).
+    pub fn pc(&self) -> crate::engine::PcIdentity {
+        crate::engine::PcIdentity {
+            id: if self.pc_id.is_empty() { "this-pc".into() } else { self.pc_id.clone() },
+            name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
+        }
+    }
+
+    /// Give this PC an ID the first time SyncApp runs (saved immediately, under a lock,
+    /// so the manager window and background service agree on it).
+    pub fn ensure_pc_id() {
+        let _lock = crate::win::NamedLock::acquire_wait("Local\\SyncApp-Config", 5000).ok().flatten();
+        if let Ok(mut cfg) = Config::load() {
+            if cfg.pc_id.is_empty() {
+                cfg.pc_id = crate::win::random_id();
+                let _ = cfg.save();
+            }
+        }
+    }
 }
 
 pub fn config_dir() -> PathBuf {

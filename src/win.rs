@@ -88,7 +88,14 @@ pub struct VolumeInfo {
 pub fn volume_root(path: &Path) -> Option<String> {
     let mut buf = [0u16; 1024];
     let ok = unsafe { GetVolumePathNameW(wide(path).as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-    (ok != 0).then(|| from_wide(&buf))
+    if ok != 0 {
+        return Some(from_wide(&buf));
+    }
+    // GetVolumePathName fails on some drive letters (e.g. ones mapped with `subst`);
+    // the drive letter's own root still works for volume queries.
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then(|| format!("{}:\\", (b[0] as char).to_ascii_uppercase()))
 }
 
 pub fn volume_info(path: &Path) -> Option<VolumeInfo> {
@@ -367,6 +374,13 @@ pub fn thread_background_mode() {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     }
+}
+
+/// Windows Battery saver is currently on.
+pub fn battery_saver_on() -> bool {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemPowerStatus(&mut s) != 0 && s.SystemStatusFlag == 1 }
 }
 
 /// Give back memory pages the process isn't using right now (e.g. after a backup).

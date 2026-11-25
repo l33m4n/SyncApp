@@ -6,7 +6,8 @@ Pick the folders and files you care about, mark the drives you trust, and SyncAp
 
 - **Only marked drives**: each backup drive carries a hidden random ID, and that ID is checked against the drive's volume serial number. A random USB stick, or a copied ID file, never receives your files.
 - **Only what changed**: unchanged files are recognised from metadata alone. If nothing changed, nothing is written to the drive.
-- **No data loss**: every copy is written to a temp file, flushed to the device, read back and checksum-verified (BLAKE3) before it replaces the previous copy. Unplugging mid-backup, a full drive or a crash can never damage an existing backup. Nothing on the drive is ever deleted, and files on the PC are only read.
+- **No data loss**: every copy is written to a temp file, flushed to the device, read back and checksum-verified (BLAKE3) before it replaces the previous copy. Unplugging mid-backup, a full drive or a crash can never damage an existing backup. Files on the PC are only read, and nothing on the drive is deleted unless you choose to in **Clean up**.
+- **Several PCs, one drive**: PCs that share a backup drive write to the same folders. For each file the newest version is kept, and an older copy from another PC never replaces a newer one.
 - **Tamper-resistant**: SyncApp never writes through junctions or symbolic links on a backup drive, so a modified drive can't redirect writes onto your PC.
 - **Lightweight**: one ~6 MB `SyncApp.exe` with no runtime. The background service is event-driven and idles at ~0% CPU, no disk access and about 2 MB of memory, in Windows' efficiency mode. Automatic backups run at background disk priority. The manager window only runs while it's open.
 
@@ -22,8 +23,10 @@ Other features:
 
 - **Per-drive options**: choose which sources go to which drive, turn automatic backup off, and schedule extra backups while the drive stays plugged in (every N minutes/hours, or at set times of day on chosen weekdays). Scheduled runs only notify you when they copied something or hit a problem.
 - **Verify integrity**: re-reads every file on the drive and checks it against the checksum recorded at backup time. Corrupted files are re-copied on the next backup.
-- **Restore**: copy a backup to its original location or to another folder. Existing files are only replaced if you tick the option.
-- **History**: every backup, verify and restore, with any per-file problems.
+- **Restore**: browse the backup, search it, and restore selected files or folders to where they came from or to another folder. Each file shows whether it's missing or different on this PC, and which PC backed it up. Existing files are only replaced if you tick the option.
+- **Clean up**: lists backed-up files that no PC has any more (deleted, renamed or moved everywhere, or from folders you stopped backing up), with their total size. Review and delete them to free space; SyncApp never deletes them on its own.
+- **Battery saver**: scheduled backups wait while Windows Battery saver is on (optional; plug-in backups still run).
+- **History**: every backup, verify, restore and clean-up, with any per-file problems.
 - **Pause**: from the tray menu or Settings.
 
 ### Where things live
@@ -36,6 +39,12 @@ Other features:
 
 Backups are plain files, so you can open them on any computer without SyncApp.
 
+### Locked and open files
+
+Files that are open in another program are normally still readable and are backed up. A file that's edited while it's being copied is copied again, so the backup is always a complete version. A file that a program keeps **exclusively locked** (for example an Outlook `.pst` while Outlook is running) can't be read: it's reported, its previous backup copy is kept, and it's picked up on the first backup after the program closes it.
+
+SyncApp doesn't use Volume Shadow Copy to read such files while they're locked, because that needs administrator rights, and granting them silently to an app installed in your user profile would let other programs abuse it.
+
 ### Encryption
 
 Use **BitLocker To Go** on the drive (right-click it in Explorer > *Turn on BitLocker*). SyncApp works unchanged on encrypted drives.
@@ -46,7 +55,17 @@ Requires Rust (stable) and the Visual Studio C++ build tools.
 
 ```powershell
 cargo build --release      # -> target\release\SyncApp.exe
-cargo test                 # engine tests
+cargo test                 # all tests
+```
+
+Every push is built and tested on Windows by GitHub Actions (`.github/workflows/ci.yml`), which also uploads `SyncApp.exe`. Pushing a tag such as `v0.2.0` publishes a GitHub Release with the exe attached.
+
+The exe is not code-signed, so Windows SmartScreen may warn the first time someone runs a downloaded copy.
+
+Performance check (backs up a folder twice and prints timings):
+
+```powershell
+cargo run --release --example bench -- <source folder> <empty target folder>
 ```
 
 If linking fails with `LNK1104: cannot open file 'msvcrt.lib'`, your Visual Studio install only has the OneCore libraries. Either add **"MSVC v14x - C++ x64/x86 build tools"** in the Visual Studio Installer, or run `. .\scripts\dev-env.ps1` in the same PowerShell session before building.
@@ -57,13 +76,18 @@ Set `SYNCAPP_HOME` to a folder to keep settings, log and history there instead (
 
 ```
 src/
-  engine.rs   change detection, verified atomic copy, verify, restore
-  service.rs  drive marking/recognition, locking, history
-  config.rs   settings
-  win.rs      Win32 helpers (drives, volume serials, mutexes, registry)
-  log.rs      log file
-  tray.rs     background service: tray icon, plug-in detection, notifications
-  gui.rs      manager window (egui)
-  main.rs     entry point, install, icon
-tests/engine.rs
+  engine.rs    change detection, verified atomic copy, verify, restore, clean-up, multi-PC manifest
+  service.rs   drive marking/recognition, locking, history
+  config.rs    settings
+  schedule.rs  schedules (intervals, times of day, daylight saving)
+  planner.rs   which drives are due for a scheduled backup, and when to wake
+  win.rs       Win32 helpers (drives, volume serials, mutexes, registry, power)
+  log.rs       log file
+  tray.rs      background service: tray icon, plug-in detection, notifications
+  gui.rs       manager window (egui)
+  main.rs      entry point, install/uninstall, icon
+build.rs       embeds the icon and version info in the exe
+assets/        app icon (regenerate with scripts/make_icon.py)
+tests/         engine, multi-PC/clean-up and restore-path tests
+examples/      bench.rs performance check
 ```

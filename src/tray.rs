@@ -27,7 +27,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use syncapp::config::{config_path, Config, DriveReg};
 use syncapp::engine::{human_bytes, Event};
-use syncapp::schedule::{self, Clock};
+use syncapp::planner::Planner;
+use syncapp::schedule::Clock;
 use syncapp::service::{self, Identity};
 use syncapp::win::{self, wide, NamedLock};
 use syncapp::{info, warn};
@@ -72,6 +73,7 @@ static HWND_G: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 static LAST_LOGGED_NEXT: AtomicU64 = AtomicU64::new(0);
+static BATTERY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 struct State {
     cfg: Config,
@@ -512,38 +514,36 @@ fn rescan_backup_drives() {
 
 // ------------------------------------------------------------------ schedules
 
+/// Run `f` with the scheduling decisions for the current state (see `planner`).
+fn with_planner<R>(f: impl FnOnce(&Planner, &Clock) -> R) -> R {
+    let clock = Clock::now();
+    let st = state();
+    let busy: Vec<String> = st.busy.iter().map(|b| b.0.clone()).collect();
+    let failed_ago: HashMap<String, u64> =
+        st.last_attempt.iter().map(|(id, t)| (id.clone(), t.elapsed().as_secs())).collect();
+    let p = Planner {
+        cfg: &st.cfg,
+        backup_drives: &st.backup_drives,
+        busy: &busy,
+        last_backup: &st.last_backup,
+        failed_ago: &failed_ago,
+        battery_saver: win::battery_saver_on(),
+    };
+    f(&p, &clock)
+}
+
 /// Set one timer for the earliest scheduled backup among plugged-in drives.
 fn reschedule() {
     let h = hwnd();
-    let next = {
-        let st = state();
-        if st.cfg.paused {
-            None
-        } else {
-            let clock = Clock::now();
-            st.backup_drives
-                .values()
-                .filter_map(|id| st.cfg.drive(id))
-                .filter(|reg| reg.auto_backup && !reg.schedule.is_off())
-                .filter(|reg| !st.busy.iter().any(|b| b.0 == reg.drive_id))
-                .filter_map(|reg| {
-                    let t = reg.schedule.next_run(st.last_backup.get(&reg.drive_id).copied(), &clock)?;
-                    // Don't retry a failed attempt sooner than RETRY_AFTER_S.
-                    let retry_at = st.last_attempt.get(&reg.drive_id).map(|a| {
-                        clock.now + schedule::RETRY_AFTER_S.saturating_sub(a.elapsed().as_secs())
-                    });
-                    Some(retry_at.map_or(t, |r| t.max(r)))
-                })
-                .min()
-                .map(|t| {
-                    // Log when the next scheduled time changes (rare), for transparency.
-                    if LAST_LOGGED_NEXT.swap(t, Ordering::Relaxed) != t {
-                        info!("Next scheduled backup at {}", win::local_time_string(t));
-                    }
-                    t.saturating_sub(clock.now)
-                })
-        }
-    };
+    let next = with_planner(|p, clock| {
+        p.next_wake(clock).map(|t| {
+            // Log when the next scheduled time changes (rare), for transparency.
+            if LAST_LOGGED_NEXT.swap(t, Ordering::Relaxed) != t && !p.postponed_by_battery(clock) {
+                info!("Next scheduled backup at {}", win::local_time_string(t));
+            }
+            t.saturating_sub(clock.now)
+        })
+    });
     unsafe {
         match next {
             None => {
@@ -559,25 +559,15 @@ fn reschedule() {
 
 fn run_due_schedules() {
     reload_config(false);
-    let clock = Clock::now();
-    let due: Vec<(String, DriveReg)> = {
-        let st = state();
-        if st.cfg.paused {
-            vec![]
-        } else {
-            st.backup_drives
-                .iter()
-                .filter_map(|(root, id)| st.cfg.drive(id).map(|r| (root.clone(), r.clone())))
-                .filter(|(_, reg)| reg.auto_backup && reg.schedule.is_due(st.last_backup.get(&reg.drive_id).copied(), &clock))
-                .filter(|(_, reg)| {
-                    st.last_attempt
-                        .get(&reg.drive_id)
-                        .is_none_or(|a| a.elapsed() >= Duration::from_secs(schedule::RETRY_AFTER_S))
-                })
-                .collect()
-        }
-    };
+    let (due, postponed) = with_planner(|p, clock| (p.due(clock), p.postponed_by_battery(clock)));
+    if postponed && !BATTERY_LOGGED.swap(true, Ordering::Relaxed) {
+        info!("Scheduled backup postponed: Battery saver is on");
+    } else if !postponed {
+        BATTERY_LOGGED.store(false, Ordering::Relaxed);
+    }
     let cfg = cfg();
+    let due: Vec<(String, DriveReg)> =
+        due.into_iter().filter_map(|(root, id)| cfg.drive(&id).cloned().map(|r| (root, r))).collect();
     for (root, reg) in due {
         info!("Scheduled backup to '{}' ({})", reg.name, reg.schedule.describe());
         start_backup(cfg.clone(), root, reg, Trigger::Scheduled);

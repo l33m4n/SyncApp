@@ -44,9 +44,13 @@ fn sources(e: &Env) -> Vec<Source> {
     ]
 }
 
+fn pc_a() -> engine::PcIdentity {
+    engine::PcIdentity { id: "pc-a".into(), name: "PC-A".into() }
+}
+
 fn backup(e: &Env) -> engine::Report {
     let no = AtomicBool::new(false);
-    engine::run_backup(&sources(e), &e.drive, &no, None)
+    engine::run_backup(&sources(e), &e.drive, &pc_a(), &no, None)
 }
 
 /// Every file on the drive with its size and mtime: proves whether anything was written.
@@ -187,7 +191,7 @@ fn cancelled_copy_leaves_old_backup_intact_and_no_temp_files() {
     backup(&e);
     write(&e.pc.join("docs/sub/b.bin"), &vec![9u8; 400_000]);
     let cancel = AtomicBool::new(true);
-    let r = engine::run_backup(&sources(&e), &e.drive, &cancel, None);
+    let r = engine::run_backup(&sources(&e), &e.drive, &pc_a(), &cancel, None);
     assert_eq!(r.aborted.as_deref(), Some("cancelled"));
     assert_eq!(fs::read(on_drive(&e, "Docs/sub/b.bin")).unwrap(), vec![7u8; 300_000]);
     assert!(snapshot(&e.drive).keys().all(|p| !p.to_string_lossy().contains(".syncapp-tmp")));
@@ -252,7 +256,7 @@ fn missing_source_is_reported_not_fatal() {
     let mut s = sources(&e);
     s.push(Source { name: "Gone".into(), path: e.pc.join("nope"), exclude: vec![], enabled: true, kind: None });
     let no = AtomicBool::new(false);
-    let r = engine::run_backup(&s, &e.drive, &no, None);
+    let r = engine::run_backup(&s, &e.drive, &pc_a(), &no, None);
     assert_eq!(r.missing_sources.len(), 1);
     assert_eq!(r.copied.len(), 3);
 }
@@ -392,7 +396,7 @@ fn file_changed_between_scan_and_copy_is_copied_as_its_latest_version() {
             }
         }
     };
-    let r = engine::run_backup(&sources(&e), &e.drive, &no, Some(&mut cb));
+    let r = engine::run_backup(&sources(&e), &e.drive, &pc_a(), &no, Some(&mut cb));
     assert!(r.ok(), "{r:?}");
     assert_eq!(fs::read(on_drive(&e, "Docs/a.txt")).unwrap(), b"edit 2, saved mid-backup");
     // And the manifest matches what's on the drive: the next run sees no changes.

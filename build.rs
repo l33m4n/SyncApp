@@ -1,0 +1,20 @@
+//! Embeds the app icon and version information into SyncApp.exe, so Explorer, the
+//! Start menu, Task Manager and file properties show them.
+
+fn main() {
+    println!("cargo:rerun-if-changed=assets/syncapp.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/syncapp.ico")
+        .set("FileDescription", "SyncApp - automatic backups to your marked drives")
+        .set("ProductName", "SyncApp")
+        .set("OriginalFilename", "SyncApp.exe")
+        .set("InternalName", "SyncApp");
+    // Version fields come from Cargo.toml's `version` automatically.
+    if let Err(e) = res.compile() {
+        // Don't fail the build over cosmetics (e.g. no resource compiler available).
+        println!("cargo:warning=could not embed icon/version info: {e}");
+    }
+}

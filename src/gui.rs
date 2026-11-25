@@ -39,6 +39,7 @@ enum Tab {
     Sources,
     Drives,
     Restore,
+    Cleanup,
     History,
     Settings,
 }
@@ -50,6 +51,7 @@ enum JobKind {
     Backup,
     Verify,
     Restore,
+    Cleanup,
 }
 
 struct JobResult {
@@ -97,6 +99,7 @@ struct RFile {
     backed_up: Option<u64>, // unix seconds of the PC file's date at backup time
     original: Option<PathBuf>,
     state: PcState,
+    from_pc: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -117,6 +120,7 @@ struct Row {
     changed: usize,
     state: PcState,
     backed_up: Option<u64>,
+    from_pc: Option<String>,
 }
 
 type Loaded = (Vec<RFile>, Vec<(String, String)>);
@@ -184,6 +188,7 @@ impl Browser {
                         key: f.key,
                         size: f.size,
                         backed_up: f.backed_up_mtime.map(engine::filetime_to_unix),
+                        from_pc: f.from_pc.clone(),
                         original,
                         state,
                     }
@@ -264,6 +269,7 @@ impl Browser {
                     changed: 0,
                     state: PcState::Same,
                     backed_up: None,
+                    from_pc: None,
                 };
                 for g in &self.files[i..j] {
                     if self.matches(g) {
@@ -317,6 +323,7 @@ fn file_row(f: &RFile, i: usize, name: String) -> Row {
         changed: (f.state == PcState::Changed) as usize,
         state: f.state,
         backed_up: f.backed_up,
+        from_pc: f.from_pc.clone(),
     }
 }
 
@@ -355,7 +362,60 @@ impl VerifyView {
 
 // ------------------------------------------------------------------ app
 
+#[derive(Clone)]
+struct DriveStat {
+    files: u64,
+    bytes: u64,
+    /// PCs that back up to this drive: (name, last backup).
+    pcs: Vec<(String, u64)>,
+}
+
+// ------------------------------------------------------------------ clean-up
+
+struct Cleanup {
+    drive_id: String,
+    root: String,
+    loader: Option<Arc<Mutex<Option<Vec<engine::Orphan>>>>>,
+    items: Vec<engine::Orphan>,
+    selected: HashSet<usize>,
+    scanned: bool,
+}
+
+impl Cleanup {
+    fn new(ctx: &egui::Context, cfg: &Config, drive_id: String, root: String) -> Self {
+        let mut c = Cleanup { drive_id, root, loader: None, items: vec![], selected: HashSet::new(), scanned: false };
+        c.scan(ctx, cfg);
+        c
+    }
+
+    fn scan(&mut self, ctx: &egui::Context, cfg: &Config) {
+        let slot = Arc::new(Mutex::new(None));
+        let (s2, root, cfg, ctx) = (slot.clone(), self.root.clone(), cfg.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let found = service::find_orphans(&cfg, &root);
+            *s2.lock().unwrap() = Some(found);
+            ctx.request_repaint();
+        });
+        self.loader = Some(slot);
+    }
+
+    fn poll(&mut self) {
+        let done = self.loader.as_ref().and_then(|l| l.lock().unwrap().take());
+        if let Some(items) = done {
+            self.items = items;
+            self.loader = None;
+            self.scanned = true;
+            self.selected = (0..self.items.len()).collect(); // all selected by default
+        }
+    }
+
+    fn selected_bytes(&self) -> u64 {
+        self.selected.iter().map(|&i| self.items[i].size).sum()
+    }
+}
+
 enum Confirm {
+    Cleanup(Vec<String>, u64),
     Uninstall,
     Unregister { id: String, name: String },
     RemoveSource(String),
@@ -367,6 +427,7 @@ struct MarkDialog {
     info: Option<VolumeInfo>,
     space: Option<(u64, u64)>,
     previously_marked: bool,
+    other_pcs: Vec<String>,
     name: String,
     auto_backup: bool,
 }
@@ -410,7 +471,7 @@ struct App {
     renaming: Option<(String, String)>,
     mark: Option<MarkDialog>,
     /// (files, bytes) per connected drive's manifest, loaded off the UI thread.
-    drive_stats: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    drive_stats: Arc<Mutex<HashMap<String, DriveStat>>>,
     drive_stats_pending: HashSet<String>,
     /// Drives currently locked by a backup/verify/restore (refreshed every couple of seconds).
     busy_drives: HashSet<String>,
@@ -422,6 +483,8 @@ struct App {
     sizes_sig: String,
     // restore tab
     browser: Option<Browser>,
+    // clean-up tab
+    cleanup: Option<Cleanup>,
     // verification report page
     verify_view: Option<VerifyView>,
     dev_verify: bool,
@@ -542,6 +605,7 @@ impl App {
             sizes: Default::default(),
             sizes_sig: String::new(),
             browser: None,
+            cleanup: None,
             verify_view: None,
             dev_verify: false,
             interval_hours: HashMap::new(),
@@ -553,6 +617,7 @@ impl App {
             Ok("sources") => app.tab = Tab::Sources,
             Ok("drives") => app.tab = Tab::Drives,
             Ok("restore") => app.tab = Tab::Restore,
+            Ok("cleanup") => app.tab = Tab::Cleanup,
             Ok("history") => app.tab = Tab::History,
             Ok("settings") => app.tab = Tab::Settings,
             Ok("verify") => app.dev_verify = true,
@@ -680,18 +745,19 @@ impl App {
         self.job.as_ref().is_some_and(|j| j.shared.lock().unwrap().result.is_none())
     }
 
-    /// (files, bytes) recorded in a connected drive's manifest. Loaded in the
+    /// What a connected drive's manifest says (files, size, PCs). Loaded in the
     /// background (a big manifest takes a moment to parse); None until ready.
-    fn drive_stat(&mut self, ctx: &egui::Context, id: &str) -> Option<(u64, u64)> {
+    fn drive_stat(&mut self, ctx: &egui::Context, id: &str) -> Option<DriveStat> {
         if let Some(s) = self.drive_stats.lock().unwrap().get(id) {
-            return Some(*s);
+            return Some(s.clone());
         }
         let root = self.connected_root(id)?;
         if self.drive_stats_pending.insert(id.to_string()) {
             let (stats, id, ctx) = (self.drive_stats.clone(), id.to_string(), ctx.clone());
             std::thread::spawn(move || {
                 let m = Manifest::load(Path::new(&root));
-                stats.lock().unwrap().insert(id, (m.files.len() as u64, m.total_bytes()));
+                let pcs = m.pcs.values().map(|p| (p.name.clone(), p.last_backup)).collect();
+                stats.lock().unwrap().insert(id, DriveStat { files: m.files.len() as u64, bytes: m.total_bytes(), pcs });
                 ctx.request_repaint();
             });
         }
@@ -785,6 +851,9 @@ impl App {
             if let Some(b) = &mut self.browser {
                 b.reload(ctx, &self.cfg);
             }
+            if let Some(c) = &mut self.cleanup {
+                c.scan(ctx, &self.cfg);
+            }
         }
     }
 
@@ -875,6 +944,7 @@ impl App {
                     (Tab::Sources, "What to back up"),
                     (Tab::Drives, "Backup drives"),
                     (Tab::Restore, "Restore"),
+                    (Tab::Cleanup, "Clean up"),
                     (Tab::History, "History"),
                     (Tab::Settings, "Settings"),
                 ] {
@@ -930,6 +1000,7 @@ impl App {
             match self.tab {
                 Tab::Drives => self.ui_drives(ui),
                 Tab::Restore => self.ui_restore(ui),
+                Tab::Cleanup => self.ui_cleanup(ui),
                 _ => {
                     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| match self.tab {
                         Tab::Overview => self.ui_overview(ui),
@@ -1349,6 +1420,17 @@ impl App {
                         info: d.info.clone(),
                         space: d.space,
                         previously_marked: d.previously_marked,
+                        other_pcs: if d.previously_marked {
+                            let me = self.cfg.pc().id;
+                            Manifest::load(Path::new(&d.root))
+                                .pcs
+                                .iter()
+                                .filter(|(id, _)| **id != me)
+                                .map(|(_, p)| p.name.clone())
+                                .collect()
+                        } else {
+                            vec![]
+                        },
                         name: label,
                         auto_backup: true,
                     });
@@ -1421,8 +1503,17 @@ impl App {
         if let Some((_, Some((free, total)), _)) = &conn {
             capacity_bar(ui, *free, *total, true);
         }
-        if let Some((files, bytes)) = stats {
-            ui.label(format!("SyncApp backup on this drive: {}, {}", files_word(files), human_bytes(bytes)));
+        if let Some(st) = &stats {
+            ui.label(format!("SyncApp backup on this drive: {}, {}", files_word(st.files), human_bytes(st.bytes)));
+            if st.pcs.len() > 1 {
+                let list = st
+                    .pcs
+                    .iter()
+                    .map(|(n, t)| format!("{n} (last backup {})", when(*t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(RichText::new(format!("Shared by {} PCs: {list}. The newest version of each file is kept.", st.pcs.len())).weak());
+            }
         }
         if let Some(h) = self.history.iter().rev().find(|h| h.drive_id == id && h.kind == "backup") {
             ui.horizontal(|ui| {
@@ -1672,8 +1763,8 @@ impl App {
             });
         });
         if !unknown {
-            let room = match (&conn, stats) {
-                (Some((_, Some((free, _)), _)), Some((_, on_drive))) => Some(free + on_drive),
+            let room = match (&conn, stats.as_ref().map(|s| s.bytes)) {
+                (Some((_, Some((free, _)), _)), Some(on_drive)) => Some(free + on_drive),
                 (Some((_, Some((free, _)), _)), None) => Some(*free),
                 _ => None,
             };
@@ -1752,7 +1843,12 @@ impl App {
             ui.label(RichText::new(
                 "SyncApp will add a hidden \".syncapp\" folder holding a random ID for this drive, and put your backups in a \"SyncApp Backup\" folder. Nothing else on the drive is touched.",
             ).weak());
-            if m.previously_marked {
+            if !m.other_pcs.is_empty() {
+                ui.label(RichText::new(format!(
+                    "This drive is already used by SyncApp on {}. This PC will share the same backup folders: for each file, the newest version is kept, and an older copy never replaces a newer one.",
+                    m.other_pcs.join(", ")
+                )).color(WARN));
+            } else if m.previously_marked {
                 ui.label(RichText::new("This drive already has SyncApp backups from before; they'll be reused.").weak());
             }
             ui.add_space(10.0);
@@ -1975,6 +2071,7 @@ impl App {
                 .column(Column::exact(190.0))
                 .column(Column::exact(90.0))
                 .column(Column::exact(170.0))
+                .column(Column::exact(120.0).clip(true))
                 .header(22.0, |mut h| {
                     h.col(|ui| {
                         let mut v = all_sel;
@@ -1993,6 +2090,9 @@ impl App {
                     });
                     h.col(|ui| {
                         ui.strong("File date");
+                    });
+                    h.col(|ui| {
+                        ui.strong("Backed up from");
                     });
                 })
                 .body(|body| {
@@ -2048,6 +2148,11 @@ impl App {
                         row.col(|ui| {
                             ui.label(r.backed_up.map(win::local_time_string).unwrap_or_default());
                         });
+                        row.col(|ui| {
+                            if let Some(pc) = &r.from_pc {
+                                ui.label(RichText::new(pc).weak());
+                            }
+                        });
                         if !r.dir && row.response().clicked() {
                             toggle_rows.push(ri);
                         }
@@ -2089,6 +2194,198 @@ impl App {
             } else {
                 self.restore_files(&ctx, files, desc);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ clean-up
+
+    fn start_cleanup(&mut self, ctx: &egui::Context, keys: Vec<String>) {
+        let Some(c) = &self.cleanup else { return };
+        let Some(reg) = self.cfg.drive(&c.drive_id).cloned() else { return };
+        let root = c.root.clone();
+        self.start_job(ctx, JobKind::Cleanup, format!("Cleaning up {}", reg.name), move |cancel, cb| {
+            match service::clean_up(&root, &reg, &keys, cancel, Some(cb)) {
+                Ok(r) => {
+                    let msg = match &r.aborted {
+                        Some(a) => format!("Clean-up stopped: {a}. Removed {} ({}).", files_word(r.removed), human_bytes(r.bytes)),
+                        None => format!("Removed {} from {}, freeing {}.", files_word(r.removed), reg.name, human_bytes(r.bytes)),
+                    };
+                    JobResult { ok: r.failed.is_empty() && r.aborted.is_none(), msg, errors: r.failed, verify: None }
+                }
+                Err(e) => JobResult { ok: false, msg: e, errors: vec![], verify: None },
+            }
+        });
+    }
+
+    fn ui_cleanup(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.heading("Clean up");
+        ui.label("Files on the backup drive that no PC needs any more: deleted, renamed or moved on every PC that had them, or from folders you no longer back up. SyncApp never deletes them on its own; review them here and remove the ones you don't want.");
+        ui.add_space(6.0);
+        if self.connected.is_empty() {
+            ui.label("Connect a marked backup drive to clean it up.");
+            self.cleanup = None;
+            return;
+        }
+        let valid = self.cleanup.as_ref().is_some_and(|c| self.connected_root(&c.drive_id).as_deref() == Some(c.root.as_str()));
+        if !valid {
+            let (c, r) = &self.connected[0];
+            self.cleanup = Some(Cleanup::new(&ctx, &self.cfg, r.drive_id.clone(), c.root.clone()));
+        }
+        let mut switch_to = None;
+        let mut rescan = false;
+        let busy = self.job_running();
+        {
+            let c = self.cleanup.as_mut().unwrap();
+            c.poll();
+            ui.horizontal(|ui| {
+                ui.label("Drive:");
+                let cur = self
+                    .connected
+                    .iter()
+                    .find(|(_, r)| r.drive_id == c.drive_id)
+                    .map(|(d, r)| format!("{} ({})", r.name, &d.root[..2]))
+                    .unwrap_or_default();
+                egui::ComboBox::from_id_salt("cdrive").selected_text(cur).show_ui(ui, |ui| {
+                    for (d, r) in &self.connected {
+                        if ui.selectable_label(r.drive_id == c.drive_id, format!("{} ({})", r.name, &d.root[..2])).clicked() {
+                            switch_to = Some((r.drive_id.clone(), d.root.clone()));
+                        }
+                    }
+                });
+                if ui.add_enabled(c.loader.is_none(), egui::Button::new("Scan again")).clicked() {
+                    rescan = true;
+                }
+            });
+        }
+        if let Some((id, root)) = switch_to {
+            self.cleanup = Some(Cleanup::new(&ctx, &self.cfg, id, root));
+            return;
+        }
+        if rescan {
+            let cfg = self.cfg.clone();
+            self.cleanup.as_mut().unwrap().scan(&ctx, &cfg);
+        }
+        let c = self.cleanup.as_mut().unwrap();
+        ui.add_space(6.0);
+        if !c.scanned {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Looking for files no PC needs...");
+            });
+            return;
+        }
+        if c.items.is_empty() {
+            ui.horizontal(|ui| {
+                dot(ui, OK);
+                ui.label("Nothing to clean up: every file on this drive still exists on at least one PC.");
+            });
+            return;
+        }
+        let total: u64 = c.items.iter().map(|o| o.size).sum();
+        let mut confirm = None;
+        egui::Panel::bottom("cleanup_bar").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.strong(format!("{} selected", files_word(c.selected.len() as u64)));
+                ui.label(RichText::new(human_bytes(c.selected_bytes())).weak());
+                if ui.small_button("Select all").clicked() {
+                    c.selected = (0..c.items.len()).collect();
+                }
+                if ui.small_button("Select none").clicked() {
+                    c.selected.clear();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = format!("Delete {} from drive...", files_word(c.selected.len() as u64));
+                    if ui.add_enabled(!c.selected.is_empty() && !busy, egui::Button::new(RichText::new(label).color(BAD))).clicked() {
+                        let mut idx: Vec<usize> = c.selected.iter().copied().collect();
+                        idx.sort();
+                        let keys = idx.iter().map(|&i| c.items[i].key.clone()).collect();
+                        confirm = Some(Confirm::Cleanup(keys, c.selected_bytes()));
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+        ui.label(format!("{} can be removed, freeing {}.", files_word(c.items.len() as u64), human_bytes(total)));
+        ui.add_space(4.0);
+        let mut toggle = None;
+        let all = c.selected.len() == c.items.len();
+        let mut toggle_all = false;
+        TableBuilder::new(ui)
+            .id_salt("cleanup_table")
+            .striped(true)
+            .auto_shrink([false; 2])
+            .sense(Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(28.0))
+            .column(Column::remainder().at_least(220.0).clip(true))
+            .column(Column::exact(230.0))
+            .column(Column::exact(90.0))
+            .column(Column::exact(170.0))
+            .header(22.0, |mut h| {
+                h.col(|ui| {
+                    let mut v = all;
+                    if ui.add(egui::Checkbox::without_text(&mut v).indeterminate(!all && !c.selected.is_empty())).changed() {
+                        toggle_all = true;
+                    }
+                });
+                for t in ["File", "Why it's no longer needed", "Size", "Last version"] {
+                    h.col(|ui| {
+                        ui.strong(t);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_H, c.items.len(), |mut row| {
+                    let i = row.index();
+                    let o = &c.items[i];
+                    let sel = c.selected.contains(&i);
+                    row.set_selected(sel);
+                    row.col(|ui| {
+                        let mut v = sel;
+                        if ui.add(egui::Checkbox::without_text(&mut v)).changed() {
+                            toggle = Some(i);
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(&o.key).on_hover_text(&o.key);
+                    });
+                    row.col(|ui| {
+                        ui.label(match o.reason {
+                            engine::OrphanReason::GoneEverywhere => "Deleted or moved on every PC",
+                            engine::OrphanReason::SourceRemoved => "Folder no longer backed up",
+                        });
+                    });
+                    row.col(|ui| {
+                        ui.label(human_bytes(o.size));
+                    });
+                    row.col(|ui| {
+                        let date = o.modified.map(win::local_time_string).unwrap_or_default();
+                        match &o.last_pc {
+                            Some(pc) => ui.label(format!("{date}, {pc}")),
+                            None => ui.label(date),
+                        };
+                    });
+                    if row.response().clicked() {
+                        toggle = Some(i);
+                    }
+                });
+            });
+        if toggle_all {
+            if all {
+                c.selected.clear();
+            } else {
+                c.selected = (0..c.items.len()).collect();
+            }
+        }
+        if let Some(i) = toggle {
+            if !c.selected.remove(&i) {
+                c.selected.insert(i);
+            }
+        }
+        if confirm.is_some() {
+            self.confirm = confirm;
         }
     }
 
@@ -2312,6 +2609,14 @@ impl App {
             self.save();
         }
         ui.add_space(4.0);
+        if ui
+            .checkbox(&mut self.cfg.skip_on_battery_saver, "Skip scheduled backups while Battery saver is on")
+            .on_hover_text("Backups when a drive is plugged in still happen.")
+            .changed()
+        {
+            self.save();
+        }
+        ui.add_space(4.0);
         if ui.checkbox(&mut self.autostart, "Start SyncApp's background service when I sign in to Windows").changed() {
             let exe = std::env::current_exe().unwrap_or_default();
             let cmd = format!("\"{}\" --tray", exe.display());
@@ -2383,6 +2688,13 @@ impl App {
     fn ui_confirm(&mut self, ctx: &egui::Context) {
         let Some(c) = &self.confirm else { return };
         let (title, body) = match c {
+            Confirm::Cleanup(keys, bytes) => (
+                format!("Permanently delete {} from the backup drive?", files_word(keys.len() as u64)),
+                format!(
+                    "This frees {}. These files no longer exist on any PC that uses this drive, so this backup is their last copy. This can't be undone.",
+                    human_bytes(*bytes)
+                ),
+            ),
             Confirm::Uninstall => (
                 "Uninstall SyncApp?".to_string(),
                 "This stops the background service, removes it from Windows startup and the Start menu, and deletes the installed program. Backups on your drives are NOT touched.".to_string(),
@@ -2450,6 +2762,7 @@ impl App {
                 self.save();
             }
             Confirm::RestoreOverwrite(files, desc) => self.restore_files(ctx, files, desc),
+            Confirm::Cleanup(keys, _) => self.start_cleanup(ctx, keys),
             Confirm::Uninstall => {
                 self.flush_save();
                 match crate::uninstall(self.uninstall_remove_data) {

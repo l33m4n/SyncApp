@@ -45,6 +45,13 @@ pub struct Report {
     pub bytes_copied: u64,
     pub duration_ms: u64,
     pub aborted: Option<String>,
+    /// Not updated because the drive already holds a newer version from another PC:
+    /// (file, that PC's name).
+    #[serde(default)]
+    pub newer_on_drive: Vec<(String, String)>,
+    /// Folders/files that couldn't be listed this time (so we don't mistake them for deleted).
+    #[serde(skip)]
+    pub unlisted: Vec<String>,
 }
 
 impl Report {
@@ -295,19 +302,63 @@ impl std::fmt::Display for Fail {
 
 // ------------------------------------------------------------------ manifest
 
+/// Which PC is running the backup. Several PCs can share one drive: they all write
+/// to the same folders, and the manifest records who has what.
+#[derive(Clone, Debug)]
+pub struct PcIdentity {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Entry {
+    /// Size and date of the version on the drive, as it was on the PC that wrote it.
     pub size: u64,
     pub mtime: u64,
     pub hash: String,
     pub dest_size: u64,
     pub dest_mtime: u64,
+    /// PC that wrote the copy on the drive (None = written before multi-PC support).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Every PC that currently has this file, with its own (size, date). Lets each PC
+    /// skip unchanged files on its own, and tells clean-up when no PC has it any more.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen: BTreeMap<String, (u64, u64)>,
+}
+
+impl Entry {
+    /// What this PC last saw of its own file (legacy entries count as this PC's).
+    fn stamp_for(&self, pc: &str) -> Option<Stamp> {
+        match self.seen.get(pc) {
+            Some(&(size, mtime)) => Some(Stamp { size, mtime }),
+            None if self.origin.is_none() && self.seen.is_empty() => Some(Stamp { size: self.size, mtime: self.mtime }),
+            None => None,
+        }
+    }
+
+    fn from_other_pc(&self, pc: &str) -> bool {
+        self.origin.as_deref().is_some_and(|o| o != pc)
+    }
+
+    /// No PC has this file any more (it was deleted, renamed or excluded everywhere).
+    pub fn orphaned(&self) -> bool {
+        self.origin.is_some() && self.seen.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PcInfo {
+    pub name: String,
+    pub last_backup: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct ManifestFile {
     version: u32,
     files: BTreeMap<String, Entry>,
+    #[serde(default)]
+    pcs: BTreeMap<String, PcInfo>,
 }
 
 /// Per-drive record of what was backed up. Lets unchanged files be skipped with
@@ -319,6 +370,8 @@ struct ManifestFile {
 pub struct Manifest {
     path: PathBuf,
     pub files: BTreeMap<String, Entry>,
+    /// PCs that back up to this drive: id -> name and last backup time.
+    pub pcs: BTreeMap<String, PcInfo>,
     dirty: bool,
 }
 
@@ -329,29 +382,71 @@ impl Manifest {
 
     pub fn load(drive_root: &Path) -> Manifest {
         let path = Self::path_for(drive_root);
-        let files = match fs::read(&path) {
+        let (files, pcs) = match fs::read(&path) {
             Ok(b) => match serde_json::from_slice::<ManifestFile>(&b) {
-                Ok(m) => m.files,
+                Ok(m) => (m.files, m.pcs),
                 Err(e) => {
                     crate::warn!("Manifest on {} unreadable ({e}); using checksum comparison", drive_root.display());
-                    BTreeMap::new()
+                    Default::default()
                 }
             },
-            Err(_) => BTreeMap::new(),
+            Err(_) => Default::default(),
         };
-        Manifest { path, files, dirty: false }
+        Manifest { path, files, pcs, dirty: false }
     }
 
-    fn record(&mut self, key: &str, src: Stamp, hash: String, dest: Stamp) {
+    /// This PC wrote a new copy of the file to the drive.
+    fn record_copy(&mut self, key: &str, pc: &str, src: Stamp, hash: String, dest: Stamp) {
+        let mut seen = self.files.remove(key).map(|e| e.seen).unwrap_or_default();
+        seen.insert(pc.to_string(), (src.size, src.mtime));
         self.files.insert(
             key.to_string(),
-            Entry { size: src.size, mtime: src.mtime, hash, dest_size: dest.size, dest_mtime: dest.mtime },
+            Entry {
+                size: src.size,
+                mtime: src.mtime,
+                hash,
+                dest_size: dest.size,
+                dest_mtime: dest.mtime,
+                origin: Some(pc.to_string()),
+                seen,
+            },
         );
         self.dirty = true;
     }
 
+    /// This PC has the file (identical to, or older than, the drive's copy); nothing copied.
+    fn record_seen(&mut self, key: &str, pc: &str, src: Stamp, dest: Option<Stamp>) {
+        if let Some(e) = self.files.get_mut(key) {
+            if e.origin.is_none() {
+                e.origin = Some(pc.to_string());
+            }
+            e.seen.insert(pc.to_string(), (src.size, src.mtime));
+            if let Some(d) = dest {
+                e.dest_size = d.size;
+                e.dest_mtime = d.mtime;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// A drive copy that wasn't in the manifest turned out identical to this PC's file.
+    fn adopt(&mut self, key: &str, pc: &str, src: Stamp, hash: String, dest: Stamp) {
+        if self.files.contains_key(key) {
+            if let Some(e) = self.files.get_mut(key) {
+                e.hash = hash;
+            }
+            self.record_seen(key, pc, src, Some(dest));
+        } else {
+            self.record_copy(key, pc, src, hash, dest);
+        }
+    }
+
+    pub fn pc_name(&self, id: &str) -> String {
+        self.pcs.get(id).map(|p| p.name.clone()).unwrap_or_else(|| "another PC".into())
+    }
+
     pub fn save(&mut self) -> io::Result<()> {
-        let mf = ManifestFile { version: 1, files: std::mem::take(&mut self.files) };
+        let mf = ManifestFile { version: 2, files: std::mem::take(&mut self.files), pcs: self.pcs.clone() };
         let res = serde_json::to_vec(&mf).map_err(io::Error::other).and_then(|b| atomic_write(&self.path, &b));
         self.files = mf.files;
         if res.is_ok() {
@@ -398,7 +493,9 @@ fn walk(root: &Path, prefix: &str, excludes: &[String], report: &mut Report, out
         let rd = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
-                report.failed.push((format!("{prefix}/{rel_dir}"), format!("cannot list folder: {e}")));
+                let k = if rel_dir.is_empty() { prefix.to_string() } else { format!("{prefix}/{rel_dir}") };
+                report.failed.push((k.clone(), format!("cannot list folder: {e}")));
+                report.unlisted.push(k);
                 continue;
             }
         };
@@ -429,7 +526,10 @@ fn walk(root: &Path, prefix: &str, excludes: &[String], report: &mut Report, out
             } else if ft.is_file() {
                 match entry.metadata() {
                     Ok(md) => out.push(Item { key: format!("{prefix}/{rel}"), path: entry.path(), stamp: Stamp::of(&md) }),
-                    Err(e) => report.failed.push((format!("{prefix}/{rel}"), e.to_string())),
+                    Err(e) => {
+                        report.failed.push((format!("{prefix}/{rel}"), e.to_string()));
+                        report.unlisted.push(format!("{prefix}/{rel}"));
+                    }
                 }
             }
         }
@@ -445,21 +545,25 @@ pub enum Action {
     CheckEntry,
     /// No trustworthy record: compare hashes of the PC file and the drive copy.
     CheckDest,
+    /// The drive's copy came from another PC: replace it only if this PC's file is newer.
+    CopyIfNewer,
 }
 
 /// None = unchanged, nothing to do.
-pub fn decide(src: Stamp, dest: Option<Stamp>, entry: Option<&Entry>) -> Option<Action> {
+pub fn decide(src: Stamp, dest: Option<Stamp>, entry: Option<&Entry>, pc: &str) -> Option<Action> {
     let Some(dest) = dest else { return Some(Action::Copy) };
     let trusted = entry.is_some_and(|e| dest.size == e.dest_size && dest.mtime == e.dest_mtime);
     if trusted {
         let e = entry.unwrap();
-        if src.size == e.size && src.mtime == e.mtime {
+        // Unchanged since this PC last looked (even if another PC has since put a
+        // different version on the drive: that one is newer, so leave it).
+        if e.stamp_for(pc) == Some(src) {
             return None;
         }
-        if src.size != e.size {
-            return Some(Action::Copy);
+        if src.size == e.size {
+            return Some(Action::CheckEntry); // may be identical content
         }
-        return Some(Action::CheckEntry);
+        return Some(if e.from_other_pc(pc) { Action::CopyIfNewer } else { Action::Copy });
     }
     // The drive copy was changed outside SyncApp, or the manifest is missing.
     if dest.size != src.size { Some(Action::Copy) } else { Some(Action::CheckDest) }
@@ -656,7 +760,13 @@ fn is_fat32(root: &Path) -> bool {
 
 // ------------------------------------------------------------------ backup
 
-pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, progress: Option<Progress>) -> Report {
+pub fn run_backup(
+    sources: &[Source],
+    drive_root: &Path,
+    pc: &PcIdentity,
+    cancel: &AtomicBool,
+    progress: Option<Progress>,
+) -> Report {
     let mut noop_cb = noop;
     let progress: Progress = match progress {
         Some(p) => p,
@@ -672,10 +782,38 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
     for s in sources {
         walk(&s.path, &s.name, &s.exclude, &mut report, &mut items);
     }
+    // Files this PC used to have but no longer does (deleted, renamed or newly excluded):
+    // forget that this PC has them, so clean-up can tell when no PC has a file any more.
+    // Sources that couldn't be read this time are left alone.
+    {
+        let scanned: HashSet<String> = items.iter().map(|i| i.key.to_lowercase()).collect();
+        let active: Vec<String> = sources
+            .iter()
+            .filter(|s| s.path.exists())
+            .map(|s| format!("{}/", s.name.to_lowercase()))
+            .collect();
+        let unlisted: Vec<String> = report.unlisted.iter().map(|u| u.to_lowercase()).collect();
+        for (key, e) in manifest.files.iter_mut() {
+            let k = key.to_lowercase();
+            if scanned.contains(&k)
+                || !active.iter().any(|a| k.starts_with(a))
+                || unlisted.iter().any(|u| k == *u || k.starts_with(&format!("{u}/")))
+            {
+                continue;
+            }
+            if e.seen.remove(&pc.id).is_some() {
+                manifest.dirty = true;
+            } else if e.origin.is_none() && e.seen.is_empty() {
+                e.origin = Some(pc.id.clone()); // legacy entry: now known to be gone
+                manifest.dirty = true;
+            }
+        }
+    }
+
     let mut plan = Vec::new();
     for it in items {
         let dest = dest_path(&backup_dir, &it.key);
-        match decide(it.stamp, stamp_opt(&dest), manifest.files.get(&it.key)) {
+        match decide(it.stamp, stamp_opt(&dest), manifest.files.get(&it.key), &pc.id) {
             None => report.unchanged += 1,
             Some(a) => plan.push((it, dest, a)),
         }
@@ -694,7 +832,7 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
         }
         let _ = fs::remove_file(&in_progress);
     }
-    if !plan.is_empty() {
+    if !plan.is_empty() || manifest.dirty {
         // Our own metadata folder must be a real folder too.
         if let Err(e) = ensure_real_dirs(drive_root, &meta_dir, &mut safe_dirs) {
             report.aborted = Some(e.to_string());
@@ -725,21 +863,36 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
             break;
         }
         progress(Event::File { index: i + 1, total, key: &it.key });
-        let res = (|| -> Result<bool, Fail> {
-            if *action != Action::Copy && identical(&it.path, dest, &mut manifest, &it.key, *action, cancel)? {
-                return Ok(false);
+        let res = (|| -> Result<Outcome, Fail> {
+            if matches!(action, Action::CheckEntry | Action::CheckDest)
+                && identical(&it.path, dest, &mut manifest, &it.key, *action, &pc.id, cancel)?
+            {
+                return Ok(Outcome::Same);
+            }
+            // The drive holds another PC's version: only a newer file may replace it.
+            if let Some(e) = manifest.files.get(&it.key) {
+                if *action != Action::Copy && e.from_other_pc(&pc.id) && it.stamp.mtime <= e.mtime {
+                    let from = manifest.pc_name(e.origin.as_deref().unwrap_or_default());
+                    let d = stamp_opt(dest);
+                    manifest.record_seen(&it.key, &pc.id, it.stamp, d);
+                    return Ok(Outcome::NewerOnDrive(from));
+                }
             }
             let (hash, s, d) = copy_verified(&it.path, dest, None, &mut ctx, &mut *progress)?;
-            manifest.record(&it.key, s, hash, d);
-            Ok(true)
+            manifest.record_copy(&it.key, &pc.id, s, hash, d);
+            Ok(Outcome::Copied)
         })();
         match res {
-            Ok(true) => {
+            Ok(Outcome::Copied) => {
                 report.copied.push(it.key.clone());
                 report.bytes_copied += it.stamp.size;
                 crate::info!("Backed up {}", it.key);
             }
-            Ok(false) => report.refreshed += 1,
+            Ok(Outcome::Same) => report.refreshed += 1,
+            Ok(Outcome::NewerOnDrive(from)) => {
+                crate::info!("Kept newer version of {} from {from}", it.key);
+                report.newer_on_drive.push((it.key.clone(), from));
+            }
             Err(Fail::Fatal(msg)) => {
                 report.aborted = Some(msg);
                 break;
@@ -754,11 +907,13 @@ pub fn run_backup(sources: &[Source], drive_root: &Path, cancel: &AtomicBool, pr
             }
         }
         if manifest.dirty && last_save.elapsed() > save_every {
+            manifest.pcs.insert(pc.id.clone(), PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix() });
             let _ = manifest.save();
             last_save = Instant::now();
         }
     }
     if manifest.dirty && drive_root.exists() {
+        manifest.pcs.insert(pc.id.clone(), PcInfo { name: pc.name.clone(), last_backup: crate::win::now_unix() });
         if let Err(e) = manifest.save() {
             crate::warn!("Could not save manifest: {e}");
         }
@@ -777,8 +932,22 @@ pub fn dest_path(base: &Path, key: &str) -> PathBuf {
     p
 }
 
+enum Outcome {
+    Copied,
+    Same,
+    NewerOnDrive(String),
+}
+
 /// Checksum-compare a file whose timestamp changed but size didn't.
-fn identical(src: &Path, dest: &Path, m: &mut Manifest, key: &str, action: Action, cancel: &AtomicBool) -> Result<bool, Fail> {
+fn identical(
+    src: &Path,
+    dest: &Path,
+    m: &mut Manifest,
+    key: &str,
+    action: Action,
+    pc: &str,
+    cancel: &AtomicBool,
+) -> Result<bool, Fail> {
     let before = stamp(src)?;
     let h = hash_file(src, cancel)?;
     if stamp(src)? != before {
@@ -791,7 +960,7 @@ fn identical(src: &Path, dest: &Path, m: &mut Manifest, key: &str, action: Actio
     if h != reference {
         return Ok(false);
     }
-    m.record(key, before, h, stamp(dest)?);
+    m.adopt(key, pc, before, h, stamp(dest)?);
     Ok(true)
 }
 
@@ -926,6 +1095,8 @@ pub struct BackupFile {
     /// Modification time of the PC file when it was backed up (FILETIME), if recorded.
     pub backed_up_mtime: Option<u64>,
     pub hash: Option<String>,
+    /// Name of the PC that wrote the copy on the drive, if known.
+    pub from_pc: Option<String>,
 }
 
 /// Every file in the backup folder on a drive, joined with the manifest.
@@ -945,6 +1116,7 @@ pub fn list_backup(drive_root: &Path) -> (Vec<BackupFile>, Vec<(String, String)>
                 size: e.map(|e| e.size).unwrap_or(it.stamp.size),
                 backed_up_mtime: e.map(|e| e.mtime),
                 hash: e.map(|e| e.hash.clone()),
+                from_pc: e.and_then(|e| e.origin.as_deref()).map(|o| manifest.pc_name(o)),
                 key: it.key,
             }
         })
@@ -1098,4 +1270,154 @@ pub fn filetime_to_unix(ft: u64) -> u64 {
 /// Size and modification time (FILETIME) of a file on the PC, if it exists.
 pub fn pc_stamp(path: &Path) -> Option<(u64, u64)> {
     stamp_opt(path).map(|s| (s.size, s.mtime))
+}
+
+// ------------------------------------------------------------------ clean-up
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrphanReason {
+    /// Deleted (or renamed/moved, or excluded) on every PC that had it.
+    GoneEverywhere,
+    /// Its source isn't backed up from this PC any more, and no other PC has the file.
+    SourceRemoved,
+}
+
+#[derive(Clone, Debug)]
+pub struct Orphan {
+    pub key: String,
+    pub size: u64,
+    pub reason: OrphanReason,
+    /// Unix time the PC version was last modified, if known.
+    pub modified: Option<u64>,
+    pub last_pc: Option<String>,
+}
+
+/// Backed-up files that no PC needs any more. `my_sources` are the source names this
+/// PC backs up. Nothing is deleted here.
+pub fn find_orphans(drive_root: &Path, my_sources: &[String], pc: &str) -> Vec<Orphan> {
+    let m = Manifest::load(drive_root);
+    let base = drive_root.join(BACKUP_DIR);
+    let mine: Vec<String> = my_sources.iter().map(|s| format!("{}/", s.to_lowercase())).collect();
+    let mut out = Vec::new();
+    for (key, e) in &m.files {
+        let in_my_sources = mine.iter().any(|p| key.to_lowercase().starts_with(p));
+        let only_me_or_nobody = e.seen.keys().all(|k| k == pc);
+        let reason = if e.orphaned() {
+            OrphanReason::GoneEverywhere
+        } else if !in_my_sources && only_me_or_nobody {
+            OrphanReason::SourceRemoved
+        } else {
+            continue;
+        };
+        let Some(st) = stamp_opt(&dest_path(&base, key)) else { continue }; // already gone from the drive
+        out.push(Orphan {
+            key: key.clone(),
+            size: st.size,
+            reason,
+            modified: Some(filetime_to_unix(e.mtime)),
+            last_pc: e.origin.as_deref().map(|o| m.pc_name(o)),
+        });
+    }
+    out
+}
+
+#[derive(Debug, Default)]
+pub struct CleanupReport {
+    pub removed: u64,
+    pub bytes: u64,
+    pub failed: Vec<(String, String)>,
+    pub aborted: Option<String>,
+}
+
+/// Permanently delete the given backed-up files from the drive and forget them.
+/// Refuses to touch anything through a junction or link; removes folders left empty.
+pub fn remove_backed_up(drive_root: &Path, keys: &[String], cancel: &AtomicBool, progress: Option<Progress>) -> CleanupReport {
+    let mut noop_cb = noop;
+    let progress: Progress = match progress {
+        Some(p) => p,
+        None => &mut noop_cb,
+    };
+    let mut m = Manifest::load(drive_root);
+    let base = drive_root.join(BACKUP_DIR);
+    let mut r = CleanupReport::default();
+    let mut safe = HashSet::new();
+    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    progress(Event::Planned { files: keys.len(), bytes: 0 });
+    for (i, key) in keys.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            r.aborted = Some("cancelled".into());
+            break;
+        }
+        if !drive_root.exists() {
+            r.aborted = Some("drive was removed".into());
+            break;
+        }
+        progress(Event::File { index: i + 1, total: keys.len(), key });
+        let path = dest_path(&base, key);
+        let res = (|| -> Result<u64, Fail> {
+            let parent = path.parent().ok_or_else(|| Fail::File("bad path".into()))?;
+            check_real_dirs(drive_root, parent, &mut safe)?;
+            let md = fs::symlink_metadata(&path)?;
+            if is_reparse(&md) || !md.is_file() {
+                return Err(Fail::File("not a regular file; left alone".into()));
+            }
+            clear_readonly(&path);
+            fs::remove_file(&path)?;
+            Ok(md.len())
+        })();
+        match res {
+            Ok(n) => {
+                r.removed += 1;
+                r.bytes += n;
+                m.files.remove(key);
+                m.dirty = true;
+                if let Some(p) = path.parent() {
+                    dirs.insert(p.to_path_buf());
+                }
+                crate::info!("Cleaned up {key}");
+            }
+            Err(Fail::File(e)) if e.contains("cannot find") => {
+                m.files.remove(key); // already gone
+                m.dirty = true;
+            }
+            Err(e) => r.failed.push((key.clone(), e.to_string())),
+        }
+    }
+    // Remove folders that are now empty, deepest first, never above the backup folder.
+    let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        let mut cur = d;
+        while cur.starts_with(&base) && cur != base {
+            if fs::remove_dir(&cur).is_err() {
+                break; // not empty (or can't): stop climbing
+            }
+            match cur.parent() {
+                Some(p) => cur = p.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+    if m.dirty && drive_root.exists() {
+        let _ = m.save();
+    }
+    r
+}
+
+/// Like ensure_real_dirs, but never creates anything.
+fn check_real_dirs(root: &Path, dir: &Path, safe: &mut HashSet<PathBuf>) -> Result<(), Fail> {
+    let rel = dir.strip_prefix(root).map_err(|_| Fail::File("outside the drive".into()))?;
+    let mut p = root.to_path_buf();
+    for c in rel.components() {
+        p.push(c);
+        if safe.contains(&p) {
+            continue;
+        }
+        let md = fs::symlink_metadata(&p)?;
+        if is_reparse(&md) || !md.is_dir() {
+            return Err(Fail::File(format!("refusing to go through a junction or link at {}", p.display())));
+        }
+        safe.insert(p.clone());
+    }
+    Ok(())
 }
