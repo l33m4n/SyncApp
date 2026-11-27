@@ -171,13 +171,21 @@ fn register_installed_app(exe: &std::path::Path, dir: &std::path::Path) -> std::
     Ok(())
 }
 
-/// Keep the version shown in Installed apps current after an update.
+/// Keep the installed copy listed in Installed apps: add the entry if it's missing
+/// (installs made before it existed), and keep its version current after an update.
 fn refresh_installed_version() {
     let Ok(exe) = std::env::current_exe() else { return };
-    if exe == install_dir().join(EXE_NAME) && win::reg_get_str(UNINSTALL_KEY, "DisplayName").is_some() {
-        if win::reg_get_str(UNINSTALL_KEY, "DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
-            let _ = win::reg_set_str(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"));
+    let dir = install_dir();
+    if exe != dir.join(EXE_NAME) {
+        return;
+    }
+    if win::reg_get_str(UNINSTALL_KEY, "DisplayName").is_none() {
+        match register_installed_app(&exe, &dir) {
+            Ok(()) => syncapp::info!("Added SyncApp to Installed apps"),
+            Err(e) => syncapp::warn!("Couldn't add SyncApp to Installed apps: {e}"),
         }
+    } else if win::reg_get_str(UNINSTALL_KEY, "DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+        let _ = win::reg_set_str(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"));
     }
 }
 
